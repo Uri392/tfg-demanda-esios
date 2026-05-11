@@ -1,0 +1,22 @@
+import sqlite3
+import pandas as pd
+
+DB_PATH = r"data\db\master_energy.sqlite"
+
+con = sqlite3.connect(DB_PATH)
+
+df = pd.read_sql("""
+SELECT
+  CAST(substr(timestamp_utc, 12, 2) AS INTEGER) AS hour,
+  AVG(temp_c) AS mean_temp_c
+FROM temperature_peninsula_hourly
+GROUP BY hour
+ORDER BY hour;
+""", con)
+
+con.close()
+
+df["mean_temp_c"] = df["mean_temp_c"].round(2)
+
+print("=== DIA TIPICO (TEMPERATURA MEDIA POR HORA) ===")
+print(df.to_string(index=False))

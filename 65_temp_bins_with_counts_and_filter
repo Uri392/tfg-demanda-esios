@@ -1,0 +1,75 @@
+import sqlite3
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+DB_PATH = r"data\db\master_energy.sqlite"
+MIN_COUNT = 200   # ajustable
+
+season_case = """
+CASE
+  WHEN CAST(substr(d.timestamp_utc, 6, 2) AS INTEGER) IN (12, 1, 2) THEN 'Invierno'
+  WHEN CAST(substr(d.timestamp_utc, 6, 2) AS INTEGER) IN (3, 4, 5) THEN 'Primavera'
+  WHEN CAST(substr(d.timestamp_utc, 6, 2) AS INTEGER) IN (6, 7, 8) THEN 'Verano'
+  WHEN CAST(substr(d.timestamp_utc, 6, 2) AS INTEGER) IN (9,10,11) THEN 'Otoño'
+END
+"""
+
+con = sqlite3.connect(DB_PATH)
+
+df = pd.read_sql(f"""
+SELECT
+  d.demand_mw,
+  t.temp_c,
+  {season_case} AS season
+FROM demand_peninsula_hourly d
+JOIN temperature_peninsula_hourly t
+  ON d.timestamp_utc = t.timestamp_utc;
+""", con)
+
+con.close()
+
+df = df.dropna(subset=["demand_mw", "temp_c"])
+df["demand_mw"] = pd.to_numeric(df["demand_mw"], errors="coerce")
+df["temp_c"] = pd.to_numeric(df["temp_c"], errors="coerce")
+df = df.dropna(subset=["demand_mw", "temp_c"])
+
+# bins de 1°C
+tmin = np.floor(df["temp_c"].min())
+tmax = np.ceil(df["temp_c"].max())
+bins = np.arange(tmin, tmax + 1, 1)
+
+df["temp_bin"] = pd.cut(df["temp_c"], bins=bins, include_lowest=True)
+df["temp_mid"] = df["temp_bin"].apply(lambda x: (x.left + x.right)/2)
+
+# Global con conteos
+g = df.groupby("temp_mid")["demand_mw"].agg(mean="mean", count="count").reset_index()
+g_f = g[g["count"] >= MIN_COUNT]
+
+print("=== GLOBAL: primeros bins (temp_mid, mean, count) ===")
+print(g_f.head(15).to_string(index=False))
+print("\n=== GLOBAL: últimos bins ===")
+print(g_f.tail(15).to_string(index=False))
+
+plt.figure(figsize=(9,5))
+plt.plot(g_f["temp_mid"], g_f["mean"])
+plt.title(f"Demanda media por bins de temperatura (global) | bins con count >= {MIN_COUNT}")
+plt.xlabel("Temperatura (°C) (centro del bin)")
+plt.ylabel("Demanda media (MW)")
+plt.tight_layout()
+plt.show()
+
+# Por estación (filtrando bins con pocos datos dentro de cada estación)
+plt.figure(figsize=(9,5))
+for s in ["Invierno", "Primavera", "Verano", "Otoño"]:
+    d = df[df["season"] == s]
+    gg = d.groupby("temp_mid")["demand_mw"].agg(mean="mean", count="count").reset_index()
+    gg = gg[gg["count"] >= MIN_COUNT]
+    plt.plot(gg["temp_mid"], gg["mean"], label=s)
+
+plt.title(f"Demanda media por bins de temperatura (por estación) | count >= {MIN_COUNT}")
+plt.xlabel("Temperatura (°C) (centro del bin)")
+plt.ylabel("Demanda media (MW)")
+plt.legend()
+plt.tight_layout()
+plt.show()

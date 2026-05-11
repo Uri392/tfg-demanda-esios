@@ -1,0 +1,705 @@
+from pathlib import Path
+import sqlite3
+import sys
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+try:
+    from pygam import LinearGAM, s, f, te, l
+except ImportError:
+    print("ERROR: No tienes instalado pygam.")
+    print("Instálalo con:")
+    print(r".\.venv\Scripts\python.exe -m pip install pygam")
+    sys.exit(1)
+
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+DB_PATH = Path("data/db/master_energy.sqlite")
+
+OUT_DIR = Path("outputs/modeling/gam_structural_correction")
+PLOT_DIR = OUT_DIR / "plots"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+DEMAND_TABLE = "demand_peninsula_hourly"
+TEMP_TABLE = "temperature_peninsula_hourly"
+
+LOW_DEMAND_THRESHOLD = 15000
+
+TRAIN_END_YEAR = 2020
+TEST_START_YEAR = 2021
+
+TIMEZONE = "Europe/Madrid"
+
+FEATURES = [
+    "temp_c",
+    "local_hour",
+    "local_day_of_week",
+    "local_month_code",
+    "is_holiday_es",
+    "temp_mean_24h_prev",
+    "year_idx",
+]
+
+
+# ============================================================
+# FUNCIONES BÁSICAS
+# ============================================================
+
+def rmse(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
+
+
+def mae(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return float(np.mean(np.abs(y_true - y_pred)))
+
+
+def r2_score_manual(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    if ss_tot == 0:
+        return np.nan
+    return float(1 - ss_res / ss_tot)
+
+
+def evaluate_model(name, season, y_train, pred_train, y_test, pred_test):
+    return {
+        "season": season,
+        "model": name,
+        "valid_physical": bool(
+            (np.min(pred_test) > 10000)
+            and (np.max(pred_test) < 50000)
+            and (np.sum(pred_test < 0) == 0)
+        ),
+        "r2_train": r2_score_manual(y_train, pred_train),
+        "r2_test": r2_score_manual(y_test, pred_test),
+        "rmse_train_mw": rmse(y_train, pred_train),
+        "rmse_test_mw": rmse(y_test, pred_test),
+        "mae_train_mw": mae(y_train, pred_train),
+        "mae_test_mw": mae(y_test, pred_test),
+        "bias_train_mw": float(np.mean(y_train - pred_train)),
+        "bias_test_mw": float(np.mean(y_test - pred_test)),
+        "p90_abs_error_test_mw": float(np.percentile(np.abs(y_test - pred_test), 90)),
+        "pred_min": float(np.min(pred_test)),
+        "pred_max": float(np.max(pred_test)),
+        "n_pred_negative": int(np.sum(pred_test < 0)),
+        "n_pred_below_10000": int(np.sum(pred_test < 10000)),
+        "n_pred_above_50000": int(np.sum(pred_test > 50000)),
+    }
+
+
+def season_from_month(month):
+    if month in [12, 1, 2]:
+        return "DJF"
+    if month in [3, 4, 5]:
+        return "MAM"
+    if month in [6, 7, 8]:
+        return "JJA"
+    if month in [9, 10, 11]:
+        return "SON"
+    return np.nan
+
+
+def season_name(season):
+    return {
+        "DJF": "Invierno",
+        "MAM": "Primavera",
+        "JJA": "Verano",
+        "SON": "Otoño",
+    }.get(season, season)
+
+
+# ============================================================
+# FESTIVOS
+# ============================================================
+
+def build_spanish_holidays(years):
+    holiday_map = {}
+
+    try:
+        import holidays
+        es_holidays = holidays.country_holidays("ES", years=list(years))
+        for date_value, name in es_holidays.items():
+            holiday_map[pd.Timestamp(date_value).date()] = str(name)
+    except Exception:
+        print("Aviso: no se ha podido cargar la librería holidays. Se usarán festivos manuales básicos.")
+
+    # Refuerzo manual de festivos nacionales fijos.
+    # Esto evita huecos raros como el 15 de agosto en algunos años.
+    fixed_holidays = {
+        "01-01": "Año Nuevo",
+        "01-06": "Reyes",
+        "05-01": "Día del Trabajo",
+        "08-15": "Asunción de la Virgen",
+        "10-12": "Fiesta Nacional de España",
+        "11-01": "Todos los Santos",
+        "12-06": "Día de la Constitución",
+        "12-08": "Inmaculada Concepción",
+        "12-25": "Navidad",
+    }
+
+    for year in years:
+        for mmdd, name in fixed_holidays.items():
+            holiday_map[pd.Timestamp(f"{year}-{mmdd}").date()] = name
+
+    return holiday_map
+
+
+# ============================================================
+# CARGA DE DATOS
+# ============================================================
+
+def load_data():
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"No se encuentra la base de datos: {DB_PATH}")
+
+    conn = sqlite3.connect(DB_PATH)
+
+    demand = pd.read_sql_query(
+        f"""
+        SELECT timestamp_utc, demand_mw
+        FROM {DEMAND_TABLE}
+        """,
+        conn,
+    )
+
+    temp = pd.read_sql_query(
+        f"""
+        SELECT timestamp_utc, temp_c
+        FROM {TEMP_TABLE}
+        """,
+        conn,
+    )
+
+    conn.close()
+
+    demand["timestamp_utc"] = pd.to_datetime(demand["timestamp_utc"], utc=True)
+    temp["timestamp_utc"] = pd.to_datetime(temp["timestamp_utc"], utc=True)
+
+    df = demand.merge(temp, on="timestamp_utc", how="inner")
+    df = df.sort_values("timestamp_utc").reset_index(drop=True)
+
+    df["timestamp_madrid"] = df["timestamp_utc"].dt.tz_convert(TIMEZONE)
+    df["local_date"] = df["timestamp_madrid"].dt.date
+    df["local_year"] = df["timestamp_madrid"].dt.year
+    df["local_month"] = df["timestamp_madrid"].dt.month
+    df["local_month_code"] = df["local_month"] - 1
+    df["local_hour"] = df["timestamp_madrid"].dt.hour
+    df["local_day_of_week"] = df["timestamp_madrid"].dt.dayofweek
+    df["is_weekend"] = df["local_day_of_week"].isin([5, 6]).astype(int)
+    df["season"] = df["local_month"].apply(season_from_month)
+    df["year_idx"] = df["local_year"] - df["local_year"].min()
+
+    holiday_map = build_spanish_holidays(range(df["local_year"].min(), df["local_year"].max() + 1))
+    df["is_holiday_es"] = df["local_date"].isin(holiday_map).astype(int)
+    df["holiday_name"] = df["local_date"].map(holiday_map).fillna("")
+
+    # Inercia térmica: temperatura media de las 24 horas anteriores
+    df["temp_mean_24h_prev"] = df["temp_c"].rolling(window=24, min_periods=24).mean().shift(1)
+
+    print(f"Filas leídas totales: {len(df):,}")
+
+    low_demand = df[df["demand_mw"] <= LOW_DEMAND_THRESHOLD]
+    print(f"Valores con demanda <= {LOW_DEMAND_THRESHOLD} MW: {len(low_demand):,}")
+
+    if len(low_demand) > 0:
+        print("\nPrimeros valores excluidos por demanda sospechosa:")
+        print(low_demand[["timestamp_utc", "timestamp_madrid", "demand_mw", "temp_c"]].head(10).to_string())
+
+    df = df[df["demand_mw"] > LOW_DEMAND_THRESHOLD].copy()
+    df = df.dropna(subset=["demand_mw", "temp_c", "temp_mean_24h_prev", "season"]).copy()
+
+    print(f"\nFilas tras filtrar demanda baja y NaN: {len(df):,}")
+
+    return df
+
+
+# ============================================================
+# TÉRMINOS GAM
+# ============================================================
+
+def climate_terms():
+    """
+    Modelo climático sin componente estructural anual explícito.
+
+    Variables:
+    0 temp_c
+    1 local_hour
+    2 local_day_of_week
+    3 local_month_code
+    4 is_holiday_es
+    5 temp_mean_24h_prev
+    6 year_idx
+    """
+    return (
+        te(0, 1, n_splines=[12, 8])  # interacción temperatura-hora
+        + f(1)                       # efecto horario
+        + f(2)                       # día de la semana
+        + f(3)                       # mes
+        + f(4)                       # festivo
+        + s(5, n_splines=8)          # inercia térmica
+    )
+
+
+def climate_plus_year_linear_terms():
+    """
+    Mismo modelo climático, pero añadiendo una tendencia anual lineal.
+    Esta variable intenta capturar cambios estructurales del nivel de demanda.
+    """
+    return (
+        te(0, 1, n_splines=[12, 8])
+        + f(1)
+        + f(2)
+        + f(3)
+        + f(4)
+        + s(5, n_splines=8)
+        + l(6)                       # tendencia anual lineal
+    )
+
+
+# ============================================================
+# CORRECCIÓN ESTRUCTURAL POR RESIDUO ANUAL
+# ============================================================
+
+def apply_residual_trend_correction(train_df, test_df, pred_train_base, pred_test_base):
+    """
+    Ajusta una corrección anual lineal usando los residuos medios del train.
+
+    Residuo = observado - predicho
+
+    Si en los últimos años del train el modelo tiende a sobreestimar,
+    el residuo será negativo y la corrección reducirá las predicciones futuras.
+    """
+
+    residual_train = train_df["demand_mw"].to_numpy() - pred_train_base
+
+    residual_by_year = (
+        pd.DataFrame({
+            "local_year": train_df["local_year"].to_numpy(),
+            "year_idx": train_df["year_idx"].to_numpy(),
+            "residual": residual_train,
+        })
+        .groupby(["local_year", "year_idx"], as_index=False)
+        .agg(residual_mean=("residual", "mean"))
+    )
+
+    # Ajuste lineal de los residuos medios anuales
+    coef = np.polyfit(
+        residual_by_year["year_idx"].to_numpy(),
+        residual_by_year["residual_mean"].to_numpy(),
+        deg=1,
+    )
+
+    corr_train = np.polyval(coef, train_df["year_idx"].to_numpy())
+    corr_test = np.polyval(coef, test_df["year_idx"].to_numpy())
+
+    pred_train_corrected = pred_train_base + corr_train
+    pred_test_corrected = pred_test_base + corr_test
+
+    return pred_train_corrected, pred_test_corrected, residual_by_year, coef
+
+
+# ============================================================
+# AJUSTE POR ESTACIÓN
+# ============================================================
+
+def fit_models_by_season(df):
+    all_metrics = []
+    all_predictions = []
+    residual_trends = []
+
+    seasons = ["DJF", "MAM", "JJA", "SON"]
+
+    for season in seasons:
+        print("\n" + "=" * 90)
+        print(f"ESTACIÓN: {season} - {season_name(season)}")
+        print("=" * 90)
+
+        df_s = df[df["season"] == season].copy()
+
+        train = df_s[df_s["local_year"] <= TRAIN_END_YEAR].copy()
+        test = df_s[df_s["local_year"] >= TEST_START_YEAR].copy()
+
+        print(f"Train: {train['local_year'].min()}-{train['local_year'].max()} | filas: {len(train):,}")
+        print(f"Test:  {test['local_year'].min()}-{test['local_year'].max()} | filas: {len(test):,}")
+
+        X_train = train[FEATURES].to_numpy()
+        y_train = train["demand_mw"].to_numpy()
+
+        X_test = test[FEATURES].to_numpy()
+        y_test = test["demand_mw"].to_numpy()
+
+        # --------------------------------------------------------
+        # Modelo 1: GAM climático sin estructura anual
+        # --------------------------------------------------------
+        print("\nAjustando modelo 1: GAM climático sin estructura anual...")
+        gam_climate = LinearGAM(climate_terms(), max_iter=300).fit(X_train, y_train)
+
+        pred_train_climate = gam_climate.predict(X_train)
+        pred_test_climate = gam_climate.predict(X_test)
+
+        all_metrics.append(
+            evaluate_model(
+                "gam_climate_no_structural",
+                season,
+                y_train,
+                pred_train_climate,
+                y_test,
+                pred_test_climate,
+            )
+        )
+
+        all_predictions.append(pd.DataFrame({
+            "season": season,
+            "model": "gam_climate_no_structural",
+            "timestamp_utc": test["timestamp_utc"].to_numpy(),
+            "timestamp_madrid": test["timestamp_madrid"].astype(str).to_numpy(),
+            "local_year": test["local_year"].to_numpy(),
+            "local_month": test["local_month"].to_numpy(),
+            "year_month": test["timestamp_madrid"].dt.strftime("%Y-%m").to_numpy(),
+            "observed_mw": y_test,
+            "predicted_mw": pred_test_climate,
+            "error_mw": y_test - pred_test_climate,
+        }))
+
+        # --------------------------------------------------------
+        # Modelo 2: GAM climático + tendencia anual lineal dentro del GAM
+        # --------------------------------------------------------
+        print("Ajustando modelo 2: GAM climático + tendencia anual lineal...")
+        gam_year_linear = LinearGAM(climate_plus_year_linear_terms(), max_iter=300).fit(X_train, y_train)
+
+        pred_train_year_linear = gam_year_linear.predict(X_train)
+        pred_test_year_linear = gam_year_linear.predict(X_test)
+
+        all_metrics.append(
+            evaluate_model(
+                "gam_climate_plus_year_linear",
+                season,
+                y_train,
+                pred_train_year_linear,
+                y_test,
+                pred_test_year_linear,
+            )
+        )
+
+        all_predictions.append(pd.DataFrame({
+            "season": season,
+            "model": "gam_climate_plus_year_linear",
+            "timestamp_utc": test["timestamp_utc"].to_numpy(),
+            "timestamp_madrid": test["timestamp_madrid"].astype(str).to_numpy(),
+            "local_year": test["local_year"].to_numpy(),
+            "local_month": test["local_month"].to_numpy(),
+            "year_month": test["timestamp_madrid"].dt.strftime("%Y-%m").to_numpy(),
+            "observed_mw": y_test,
+            "predicted_mw": pred_test_year_linear,
+            "error_mw": y_test - pred_test_year_linear,
+        }))
+
+        # --------------------------------------------------------
+        # Modelo 3: GAM climático + corrección estructural por residuo anual
+        # --------------------------------------------------------
+        print("Ajustando modelo 3: GAM climático + corrección por residuo anual...")
+
+        (
+            pred_train_resid_corr,
+            pred_test_resid_corr,
+            residual_by_year,
+            coef,
+        ) = apply_residual_trend_correction(
+            train,
+            test,
+            pred_train_climate,
+            pred_test_climate,
+        )
+
+        residual_by_year["season"] = season
+        residual_by_year["season_name"] = season_name(season)
+        residual_by_year["trend_coef_a"] = coef[0]
+        residual_by_year["trend_coef_b"] = coef[1]
+        residual_trends.append(residual_by_year)
+
+        all_metrics.append(
+            evaluate_model(
+                "gam_climate_plus_residual_year_trend",
+                season,
+                y_train,
+                pred_train_resid_corr,
+                y_test,
+                pred_test_resid_corr,
+            )
+        )
+
+        all_predictions.append(pd.DataFrame({
+            "season": season,
+            "model": "gam_climate_plus_residual_year_trend",
+            "timestamp_utc": test["timestamp_utc"].to_numpy(),
+            "timestamp_madrid": test["timestamp_madrid"].astype(str).to_numpy(),
+            "local_year": test["local_year"].to_numpy(),
+            "local_month": test["local_month"].to_numpy(),
+            "year_month": test["timestamp_madrid"].dt.strftime("%Y-%m").to_numpy(),
+            "observed_mw": y_test,
+            "predicted_mw": pred_test_resid_corr,
+            "error_mw": y_test - pred_test_resid_corr,
+        }))
+
+    metrics_df = pd.DataFrame(all_metrics)
+    predictions_df = pd.concat(all_predictions, ignore_index=True)
+    residual_trends_df = pd.concat(residual_trends, ignore_index=True)
+
+    return metrics_df, predictions_df, residual_trends_df
+
+
+# ============================================================
+# RESÚMENES
+# ============================================================
+
+def build_summaries(metrics_df, predictions_df):
+    # Mejor modelo por estación según RMSE test
+    best_by_season = (
+        metrics_df
+        .sort_values(["season", "rmse_test_mw"])
+        .groupby("season", as_index=False)
+        .first()
+    )
+
+    # Métricas globales sobre todo el periodo test
+    global_rows = []
+
+    for model, group in predictions_df.groupby("model"):
+        y = group["observed_mw"].to_numpy()
+        pred = group["predicted_mw"].to_numpy()
+
+        global_rows.append({
+            "model": model,
+            "r2_test_global": r2_score_manual(y, pred),
+            "rmse_test_global_mw": rmse(y, pred),
+            "mae_test_global_mw": mae(y, pred),
+            "bias_test_global_mw": float(np.mean(y - pred)),
+            "p90_abs_error_global_mw": float(np.percentile(np.abs(y - pred), 90)),
+            "pred_min": float(np.min(pred)),
+            "pred_max": float(np.max(pred)),
+        })
+
+    global_metrics = pd.DataFrame(global_rows).sort_values("rmse_test_global_mw")
+
+    # Mejora respecto al modelo climático sin estructura
+    base = metrics_df[metrics_df["model"] == "gam_climate_no_structural"].copy()
+    base = base.rename(columns={
+        "rmse_test_mw": "base_rmse_test_mw",
+        "mae_test_mw": "base_mae_test_mw",
+        "r2_test": "base_r2_test",
+        "bias_test_mw": "base_bias_test_mw",
+    })
+
+    comparison = metrics_df.merge(
+        base[["season", "base_rmse_test_mw", "base_mae_test_mw", "base_r2_test", "base_bias_test_mw"]],
+        on="season",
+        how="left",
+    )
+
+    comparison["delta_rmse_vs_climate_base_mw"] = comparison["rmse_test_mw"] - comparison["base_rmse_test_mw"]
+    comparison["delta_mae_vs_climate_base_mw"] = comparison["mae_test_mw"] - comparison["base_mae_test_mw"]
+    comparison["delta_r2_vs_climate_base"] = comparison["r2_test"] - comparison["base_r2_test"]
+    comparison["delta_abs_bias_vs_climate_base_mw"] = comparison["bias_test_mw"].abs() - comparison["base_bias_test_mw"].abs()
+
+    comparison = comparison.sort_values(["season", "rmse_test_mw"])
+
+    return best_by_season, global_metrics, comparison
+
+
+# ============================================================
+# GRÁFICOS
+# ============================================================
+
+def make_plots(predictions_df, best_by_season, metrics_df):
+    # --------------------------------------------------------
+    # Gráfico 1: observado vs predicho mensual para el mejor modelo por estación
+    # --------------------------------------------------------
+
+    best_keys = set(zip(best_by_season["season"], best_by_season["model"]))
+
+    best_preds = predictions_df[
+        predictions_df.apply(lambda r: (r["season"], r["model"]) in best_keys, axis=1)
+    ].copy()
+
+    monthly = (
+        best_preds
+        .groupby("year_month", as_index=False)
+        .agg(
+            observed_mw=("observed_mw", "mean"),
+            predicted_mw=("predicted_mw", "mean"),
+        )
+    )
+
+    plt.figure(figsize=(14, 6))
+    plt.plot(monthly["year_month"], monthly["observed_mw"], marker="o", label="Observado")
+    plt.plot(monthly["year_month"], monthly["predicted_mw"], marker="o", label="Predicho mejor modelo estacional")
+    plt.xticks(rotation=60)
+    plt.ylabel("Demanda media mensual (MW)")
+    plt.xlabel("Mes")
+    plt.title("Periodo test 2021-2025: observado vs predicho\nMejor modelo GAM por estación")
+    plt.grid(alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(PLOT_DIR / "23_observed_vs_predicted_monthly_best_seasonal_models.png", dpi=200)
+    plt.close()
+
+    # --------------------------------------------------------
+    # Gráfico 2: RMSE por estación y modelo
+    # --------------------------------------------------------
+
+    pivot_rmse = metrics_df.pivot(index="season", columns="model", values="rmse_test_mw")
+    pivot_rmse = pivot_rmse.loc[["DJF", "MAM", "JJA", "SON"]]
+
+    ax = pivot_rmse.plot(kind="bar", figsize=(12, 6))
+    ax.set_ylabel("RMSE test (MW)")
+    ax.set_xlabel("Estación")
+    ax.set_title("Comparación de RMSE test por estación y modelo")
+    ax.grid(axis="y", alpha=0.3)
+    plt.xticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig(PLOT_DIR / "23_rmse_test_by_season_and_model.png", dpi=200)
+    plt.close()
+
+    # --------------------------------------------------------
+    # Gráfico 3: sesgo por estación y modelo
+    # --------------------------------------------------------
+
+    pivot_bias = metrics_df.pivot(index="season", columns="model", values="bias_test_mw")
+    pivot_bias = pivot_bias.loc[["DJF", "MAM", "JJA", "SON"]]
+
+    ax = pivot_bias.plot(kind="bar", figsize=(12, 6))
+    ax.axhline(0, linewidth=1)
+    ax.set_ylabel("Bias test (MW)\nobservado - predicho")
+    ax.set_xlabel("Estación")
+    ax.set_title("Sesgo medio en test por estación y modelo")
+    ax.grid(axis="y", alpha=0.3)
+    plt.xticks(rotation=0)
+    plt.tight_layout()
+    plt.savefig(PLOT_DIR / "23_bias_test_by_season_and_model.png", dpi=200)
+    plt.close()
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    df = load_data()
+
+    print("\nSplit temporal global:")
+    print(f"- Train: <= {TRAIN_END_YEAR}")
+    print(f"- Test:  >= {TEST_START_YEAR}")
+
+    metrics_df, predictions_df, residual_trends_df = fit_models_by_season(df)
+
+    best_by_season, global_metrics, comparison = build_summaries(metrics_df, predictions_df)
+
+    make_plots(predictions_df, best_by_season, metrics_df)
+
+    # Guardar archivos
+    metrics_path = OUT_DIR / "23_metrics_by_season_and_model.csv"
+    best_path = OUT_DIR / "23_best_model_by_season.csv"
+    global_path = OUT_DIR / "23_global_test_metrics_by_model.csv"
+    comparison_path = OUT_DIR / "23_structural_improvement_vs_climate_base.csv"
+    predictions_path = OUT_DIR / "23_test_predictions_all_models.csv"
+    residual_path = OUT_DIR / "23_residual_trend_by_train_year.csv"
+
+    metrics_df.to_csv(metrics_path, index=False)
+    best_by_season.to_csv(best_path, index=False)
+    global_metrics.to_csv(global_path, index=False)
+    comparison.to_csv(comparison_path, index=False)
+    predictions_df.to_csv(predictions_path, index=False)
+    residual_trends_df.to_csv(residual_path, index=False)
+
+    print("\n" + "=" * 100)
+    print("RESUMEN GLOBAL DE MODELOS POR ESTACIÓN")
+    print("=" * 100)
+    cols = [
+        "season",
+        "model",
+        "valid_physical",
+        "r2_train",
+        "r2_test",
+        "rmse_train_mw",
+        "rmse_test_mw",
+        "mae_train_mw",
+        "mae_test_mw",
+        "bias_test_mw",
+        "p90_abs_error_test_mw",
+        "pred_min",
+        "pred_max",
+        "n_pred_below_10000",
+        "n_pred_above_50000",
+    ]
+    print(metrics_df[cols].sort_values(["season", "rmse_test_mw"]).to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("MEJOR MODELO POR ESTACIÓN")
+    print("=" * 100)
+    print(best_by_season[
+        [
+            "season",
+            "model",
+            "valid_physical",
+            "r2_test",
+            "rmse_test_mw",
+            "mae_test_mw",
+            "bias_test_mw",
+            "p90_abs_error_test_mw",
+            "pred_min",
+            "pred_max",
+        ]
+    ].to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("MÉTRICAS GLOBALES EN TEST 2021-2025")
+    print("=" * 100)
+    print(global_metrics.to_string(index=False))
+
+    print("\n" + "=" * 100)
+    print("MEJORA RESPECTO AL GAM CLIMÁTICO SIN ESTRUCTURA")
+    print("=" * 100)
+    print(comparison[
+        [
+            "season",
+            "model",
+            "rmse_test_mw",
+            "delta_rmse_vs_climate_base_mw",
+            "mae_test_mw",
+            "delta_mae_vs_climate_base_mw",
+            "r2_test",
+            "delta_r2_vs_climate_base",
+            "bias_test_mw",
+            "delta_abs_bias_vs_climate_base_mw",
+        ]
+    ].to_string(index=False))
+
+    print("\nArchivos generados:")
+    print(f"- Métricas por estación/modelo: {metrics_path}")
+    print(f"- Mejor modelo por estación: {best_path}")
+    print(f"- Métricas globales: {global_path}")
+    print(f"- Comparación vs base climático: {comparison_path}")
+    print(f"- Predicciones test: {predictions_path}")
+    print(f"- Tendencias de residuo anual: {residual_path}")
+    print(f"- Gráfico mensual observado vs predicho: {PLOT_DIR / '23_observed_vs_predicted_monthly_best_seasonal_models.png'}")
+    print(f"- Gráfico RMSE por estación/modelo: {PLOT_DIR / '23_rmse_test_by_season_and_model.png'}")
+    print(f"- Gráfico bias por estación/modelo: {PLOT_DIR / '23_bias_test_by_season_and_model.png'}")
+
+
+if __name__ == "__main__":
+    main()

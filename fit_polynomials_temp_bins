@@ -1,0 +1,202 @@
+from pathlib import Path
+import sqlite3
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# =========================
+# CONFIGURACIÓN
+# =========================
+
+DB_PATH = Path("data/db/master_energy.sqlite")
+OUT_DIR = Path("outputs/polynomial_bins")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+BIN_WIDTH = 1.0
+MIN_COUNT = 200
+
+DEGREES = [1, 2, 3, 4]
+
+
+# =========================
+# FUNCIONES AUXILIARES
+# =========================
+
+def r2_score(y_true, y_pred):
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+
+    if ss_tot == 0:
+        return np.nan
+
+    return 1 - ss_res / ss_tot
+
+
+def main():
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"No encuentro la base de datos en: {DB_PATH}")
+
+    print("Leyendo datos desde SQLite...")
+
+    query = """
+    SELECT
+        d.timestamp_utc,
+        d.demand_mw,
+        t.temp_c
+    FROM demand_peninsula_hourly d
+    INNER JOIN temperature_peninsula_hourly t
+        ON d.timestamp_utc = t.timestamp_utc
+    ORDER BY d.timestamp_utc
+    """
+
+    with sqlite3.connect(DB_PATH) as conn:
+        df = pd.read_sql_query(query, conn)
+
+    print(f"Filas leídas: {len(df):,}")
+
+    # Comprobación básica
+    required_cols = {"timestamp_utc", "demand_mw", "temp_c"}
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Faltan columnas necesarias: {missing}")
+
+    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"])
+    df["demand_mw"] = pd.to_numeric(df["demand_mw"], errors="coerce")
+    df["temp_c"] = pd.to_numeric(df["temp_c"], errors="coerce")
+
+    before = len(df)
+    df = df.dropna(subset=["demand_mw", "temp_c"])
+    after = len(df)
+
+    if after < before:
+        print(f"Se han eliminado {before - after:,} filas con NaN.")
+
+    # =========================
+    # CREAR BINS DE TEMPERATURA
+    # =========================
+
+    df["temp_bin"] = np.floor(df["temp_c"] / BIN_WIDTH) * BIN_WIDTH
+
+    bins = (
+        df.groupby("temp_bin")
+        .agg(
+            count=("demand_mw", "size"),
+            temp_c_mean=("temp_c", "mean"),
+            demand_mw_mean=("demand_mw", "mean"),
+            demand_mw_median=("demand_mw", "median"),
+            demand_mw_q1=("demand_mw", lambda x: x.quantile(0.25)),
+            demand_mw_q3=("demand_mw", lambda x: x.quantile(0.75)),
+        )
+        .reset_index()
+    )
+
+    bins["demand_mw_iqr"] = bins["demand_mw_q3"] - bins["demand_mw_q1"]
+
+    bins_all_path = OUT_DIR / "temperature_bins_all.csv"
+    bins.to_csv(bins_all_path, index=False)
+
+    bins_f = bins[bins["count"] >= MIN_COUNT].copy()
+
+    if len(bins_f) < 5:
+        raise ValueError(
+            f"Hay muy pocos bins con count >= {MIN_COUNT}. "
+            f"Solo quedan {len(bins_f)} bins."
+        )
+
+    bins_filtered_path = OUT_DIR / f"temperature_bins_count_ge_{MIN_COUNT}.csv"
+    bins_f.to_csv(bins_filtered_path, index=False)
+
+    print(f"Bins totales: {len(bins)}")
+    print(f"Bins con count >= {MIN_COUNT}: {len(bins_f)}")
+    print(f"Rango temperatura filtrado: {bins_f['temp_c_mean'].min():.2f} ºC a {bins_f['temp_c_mean'].max():.2f} ºC")
+
+    # =========================
+    # AJUSTES POLINÓMICOS
+    # =========================
+
+    x = bins_f["temp_c_mean"].to_numpy()
+    y = bins_f["demand_mw_mean"].to_numpy()
+
+    x_grid = np.linspace(x.min(), x.max(), 300)
+
+    results = []
+
+    plt.figure(figsize=(10, 6))
+
+    # Puntos observados por bin
+    plt.scatter(
+        x,
+        y,
+        s=bins_f["count"] / bins_f["count"].max() * 80,
+        alpha=0.75,
+        label="Media por bin"
+    )
+
+    for degree in DEGREES:
+        coeffs = np.polyfit(x, y, degree)
+        poly = np.poly1d(coeffs)
+
+        y_pred = poly(x)
+        y_grid = poly(x_grid)
+
+        r2 = r2_score(y, y_pred)
+
+        results.append({
+            "degree": degree,
+            "r2_on_bins": r2,
+            "n_bins": len(bins_f),
+            "min_count": MIN_COUNT,
+            "bin_width_c": BIN_WIDTH,
+            "coefficients_high_to_low": coeffs.tolist(),
+        })
+
+        plt.plot(
+            x_grid,
+            y_grid,
+            linewidth=2,
+            label=f"Grado {degree} | R²={r2:.3f}"
+        )
+
+    plt.xlabel("Temperatura media del bin (ºC)")
+    plt.ylabel("Demanda media del bin (MW)")
+    plt.title(
+        f"Ajustes polinómicos demanda-temperatura\n"
+        f"Bins de {BIN_WIDTH:.0f} ºC con count >= {MIN_COUNT}"
+    )
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    fig_path = OUT_DIR / f"polyfit_degrees_1_4_bins_count_ge_{MIN_COUNT}.png"
+    plt.savefig(fig_path, dpi=200)
+    plt.close()
+
+    # =========================
+    # GUARDAR MÉTRICAS
+    # =========================
+
+    results_df = pd.DataFrame(results)
+    metrics_path = OUT_DIR / f"polyfit_degrees_1_4_metrics_count_ge_{MIN_COUNT}.csv"
+    results_df.to_csv(metrics_path, index=False)
+
+    print("\nComparación de R² sobre medias por bin:")
+    print(results_df[["degree", "r2_on_bins", "n_bins"]].to_string(index=False))
+
+    print("\nArchivos generados:")
+    print(f"- {fig_path}")
+    print(f"- {metrics_path}")
+    print(f"- {bins_filtered_path}")
+    print(f"- {bins_all_path}")
+
+    print("\nNota crítica:")
+    print(
+        "El R² está calculado sobre medias por bin, no sobre datos horarios. "
+        "Sirve para comparar la forma media demanda-temperatura, pero puede "
+        "parecer más alto que un ajuste sobre todos los puntos horarios."
+    )
+
+
+if __name__ == "__main__":
+    main()

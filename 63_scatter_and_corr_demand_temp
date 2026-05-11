@@ -1,0 +1,80 @@
+import sqlite3
+import pandas as pd
+import matplotlib.pyplot as plt
+
+DB_PATH = r"data\db\master_energy.sqlite"
+
+season_case = """
+CASE
+  WHEN CAST(substr(d.timestamp_utc, 6, 2) AS INTEGER) IN (12, 1, 2) THEN 'Invierno'
+  WHEN CAST(substr(d.timestamp_utc, 6, 2) AS INTEGER) IN (3, 4, 5) THEN 'Primavera'
+  WHEN CAST(substr(d.timestamp_utc, 6, 2) AS INTEGER) IN (6, 7, 8) THEN 'Verano'
+  WHEN CAST(substr(d.timestamp_utc, 6, 2) AS INTEGER) IN (9,10,11) THEN 'Otoño'
+END
+"""
+
+con = sqlite3.connect(DB_PATH)
+
+# Join por timestamp_utc (demanda + temperatura)
+df = pd.read_sql(f"""
+SELECT
+  d.timestamp_utc,
+  d.demand_mw,
+  t.temp_c,
+  {season_case} AS season
+FROM demand_peninsula_hourly d
+JOIN temperature_peninsula_hourly t
+  ON d.timestamp_utc = t.timestamp_utc
+ORDER BY d.timestamp_utc;
+""", con)
+
+con.close()
+
+# Convertir a numérico por si acaso
+df["demand_mw"] = pd.to_numeric(df["demand_mw"], errors="coerce")
+df["temp_c"] = pd.to_numeric(df["temp_c"], errors="coerce")
+
+# Quitar NaNs
+df = df.dropna(subset=["demand_mw", "temp_c"])
+
+# --- Correlación global ---
+r_global = df["demand_mw"].corr(df["temp_c"])
+print("=== CORRELACIÓN GLOBAL ===")
+print(f"r (Pearson) = {r_global:.4f}")
+print(f"R^2 (lineal) = {r_global**2:.4f}")
+
+# --- Correlación por estación ---
+print("\n=== CORRELACIÓN POR ESTACIÓN ===")
+rows = []
+for s in ["Invierno", "Primavera", "Verano", "Otoño"]:
+    d = df[df["season"] == s]
+    r = d["demand_mw"].corr(d["temp_c"])
+    rows.append((s, len(d), r, r**2))
+out = pd.DataFrame(rows, columns=["season", "n", "r", "r2"])
+print(out.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+
+# --- Scatter global (muestra) ---
+# Para que no pese (175k puntos), muestreamos
+sample_n = 30000
+df_s = df.sample(n=min(sample_n, len(df)), random_state=42)
+
+plt.figure(figsize=(8,6))
+plt.scatter(df_s["temp_c"], df_s["demand_mw"], s=6, alpha=0.25)
+plt.title("Demanda vs Temperatura (muestra aleatoria)")
+plt.xlabel("Temperatura (°C)")
+plt.ylabel("Demanda (MW)")
+plt.tight_layout()
+plt.show()
+
+# --- Scatter por estación (muestra) ---
+plt.figure(figsize=(8,6))
+for s in ["Invierno", "Primavera", "Verano", "Otoño"]:
+    d = df_s[df_s["season"] == s]
+    plt.scatter(d["temp_c"], d["demand_mw"], s=6, alpha=0.25, label=s)
+
+plt.title("Demanda vs Temperatura por estación (muestra aleatoria)")
+plt.xlabel("Temperatura (°C)")
+plt.ylabel("Demanda (MW)")
+plt.legend()
+plt.tight_layout()
+plt.show()

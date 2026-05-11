@@ -1,0 +1,95 @@
+import sqlite3
+import pandas as pd
+import matplotlib.pyplot as plt
+
+DB_PATH = r"data\db\master_energy.sqlite"
+
+FIRST_START, FIRST_END = 2006, 2010
+LAST_START, LAST_END   = 2021, 2025
+
+def monthly_means(con, table, value_col, y0, y1, out_col):
+    df = pd.read_sql(f"""
+        SELECT
+          CAST(substr(timestamp_utc, 6, 2) AS INTEGER) AS month,
+          AVG({value_col}) AS {out_col}
+        FROM {table}
+        WHERE CAST(substr(timestamp_utc, 1, 4) AS INTEGER) BETWEEN {y0} AND {y1}
+        GROUP BY month
+        ORDER BY month;
+    """, con)
+    return df
+
+con = sqlite3.connect(DB_PATH)
+
+# FIRST 5 years
+d_first = monthly_means(con, "demand_peninsula_hourly", "demand_mw", FIRST_START, FIRST_END, "mean_demand_mw")
+t_first = monthly_means(con, "temperature_peninsula_hourly", "temp_c", FIRST_START, FIRST_END, "mean_temp_c")
+first = d_first.merge(t_first, on="month", how="inner")
+
+# LAST 5 years
+d_last = monthly_means(con, "demand_peninsula_hourly", "demand_mw", LAST_START, LAST_END, "mean_demand_mw")
+t_last = monthly_means(con, "temperature_peninsula_hourly", "temp_c", LAST_START, LAST_END, "mean_temp_c")
+last = d_last.merge(t_last, on="month", how="inner")
+
+con.close()
+
+# Redondeos
+first["mean_demand_mw"] = first["mean_demand_mw"].round(1)
+first["mean_temp_c"] = first["mean_temp_c"].round(2)
+
+last["mean_demand_mw"] = last["mean_demand_mw"].round(1)
+last["mean_temp_c"] = last["mean_temp_c"].round(2)
+
+print(f"\n=== AÑO TÍPICO MENSUAL {FIRST_START}-{FIRST_END} ===")
+print(first.to_string(index=False))
+
+print(f"\n=== AÑO TÍPICO MENSUAL {LAST_START}-{LAST_END} ===")
+print(last.to_string(index=False))
+
+month_names = {1:"Ene",2:"Feb",3:"Mar",4:"Abr",5:"May",6:"Jun",7:"Jul",8:"Ago",9:"Sep",10:"Oct",11:"Nov",12:"Dic"}
+x_labels = [month_names[m] for m in range(1, 13)]
+
+# --- Plot demanda comparativa ---
+plt.figure(figsize=(10,5))
+plt.plot(first["month"], first["mean_demand_mw"], marker="o", label=f"Demanda {FIRST_START}-{FIRST_END}")
+plt.plot(last["month"],  last["mean_demand_mw"],  marker="o", linestyle="--", label=f"Demanda {LAST_START}-{LAST_END}")
+plt.xticks(range(1,13), x_labels)
+plt.xlabel("Mes")
+plt.ylabel("Demanda media (MW)")
+plt.title("Comparación año típico mensual - Demanda")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# --- Plot temperatura comparativa ---
+plt.figure(figsize=(10,5))
+plt.plot(first["month"], first["mean_temp_c"], marker="o", label=f"Temp {FIRST_START}-{FIRST_END}")
+plt.plot(last["month"],  last["mean_temp_c"],  marker="o", linestyle="--", label=f"Temp {LAST_START}-{LAST_END}")
+plt.xticks(range(1,13), x_labels)
+plt.xlabel("Mes")
+plt.ylabel("Temperatura media (°C)")
+plt.title("Comparación año típico mensual - Temperatura")
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# --- Doble eje (uno por periodo) ---
+def plot_double_axis(df, title):
+    fig, ax1 = plt.subplots(figsize=(10,5))
+    l1, = ax1.plot(df["month"], df["mean_demand_mw"], marker="o", label="Demanda (MW)")
+    ax1.set_xlabel("Mes")
+    ax1.set_ylabel("Demanda media (MW)")
+    ax1.set_xticks(range(1,13))
+    ax1.set_xticklabels(x_labels)
+
+    ax2 = ax1.twinx()
+    l2, = ax2.plot(df["month"], df["mean_temp_c"], marker="o", linestyle="--", label="Temperatura (°C)")
+    ax2.set_ylabel("Temperatura media (°C)")
+
+    ax1.legend(handles=[l1, l2], loc="upper right")
+    plt.title(title)
+    plt.tight_layout()
+    plt.show()
+
+plot_double_axis(first, f"Año típico mensual {FIRST_START}-{FIRST_END}: demanda vs temperatura")
+plot_double_axis(last,  f"Año típico mensual {LAST_START}-{LAST_END}: demanda vs temperatura")

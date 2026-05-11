@@ -1,0 +1,191 @@
+from pathlib import Path
+import unicodedata
+
+import pandas as pd
+
+
+# =========================
+# CONFIGURACIÓN
+# =========================
+
+XLSX_PATH = Path("data/external/macro/miteco_webtabla_inv_ed2026.xlsx")
+OUT_DIR = Path("outputs/macro")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+SHEETS_TO_CHECK = [
+    "Contaminantes-TotalNacional",
+    "Total GEI por gas y sector",
+]
+
+OUT_TXT = OUT_DIR / "co2_miteco_preview_selected_sheets.txt"
+
+
+def normalize_text(value):
+    """
+    Convierte cualquier valor a texto normalizado para buscar palabras clave.
+    """
+    if pd.isna(value):
+        return ""
+
+    text = str(value).strip().lower()
+    text = text.replace("₂", "2")
+
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+
+    return text
+
+
+def safe_row_to_text(row):
+    """
+    Convierte una fila completa a texto sin romper si hay números.
+    """
+    return " | ".join(normalize_text(v) for v in row.tolist())
+
+
+def inspect_sheet(sheet_name, lines):
+    lines.append("=" * 100)
+    lines.append(f"HOJA: {sheet_name}")
+    lines.append("=" * 100)
+
+    # Intento 1: leer con cabecera automática
+    try:
+        df_header = pd.read_excel(
+            XLSX_PATH,
+            sheet_name=sheet_name,
+            dtype=object,
+        )
+
+        lines.append("")
+        lines.append("LECTURA CON CABECERA AUTOMÁTICA")
+        lines.append("-" * 100)
+        lines.append(f"Dimensión: {df_header.shape[0]} filas x {df_header.shape[1]} columnas")
+        lines.append("")
+        lines.append("Columnas detectadas:")
+        for i, col in enumerate(df_header.columns):
+            lines.append(f"  col {i}: {repr(col)}")
+
+        lines.append("")
+        lines.append("Primeras 10 filas:")
+        lines.append(df_header.head(10).to_string(index=True, max_cols=60))
+
+        # Buscar columnas relacionadas con CO2
+        lines.append("")
+        lines.append("Columnas que parecen relacionadas con CO2/CO₂:")
+        found_cols = False
+
+        for i, col in enumerate(df_header.columns):
+            col_norm = normalize_text(col)
+            if "co2" in col_norm or "dioxido" in col_norm or "carbono" in col_norm:
+                found_cols = True
+                lines.append(f"  col {i}: {repr(col)}")
+
+        if not found_cols:
+            lines.append("  No se han encontrado columnas CO2 con búsqueda simple.")
+
+    except Exception as e:
+        lines.append("")
+        lines.append("Error leyendo con cabecera automática:")
+        lines.append(str(e))
+
+    # Intento 2: leer sin cabecera
+    try:
+        df_raw = pd.read_excel(
+            XLSX_PATH,
+            sheet_name=sheet_name,
+            header=None,
+            dtype=object,
+        )
+
+        lines.append("")
+        lines.append("LECTURA SIN CABECERA")
+        lines.append("-" * 100)
+        lines.append(f"Dimensión: {df_raw.shape[0]} filas x {df_raw.shape[1]} columnas")
+
+        lines.append("")
+        lines.append("Primeras 30 filas y 35 columnas:")
+        lines.append(df_raw.iloc[:30, :35].to_string(index=True, max_cols=35))
+
+        # Buscar CO2 en cualquier celda
+        lines.append("")
+        lines.append("Celdas donde aparece CO2 / CO₂ / dióxido / carbono:")
+        found_cells = False
+
+        for row_idx in range(df_raw.shape[0]):
+            for col_idx in range(df_raw.shape[1]):
+                value = df_raw.iat[row_idx, col_idx]
+                text = normalize_text(value)
+
+                if (
+                    "co2" in text
+                    or "dioxido" in text
+                    or "carbono" in text
+                    or "carbon dioxide" in text
+                ):
+                    found_cells = True
+                    lines.append(
+                        f"  fila={row_idx}, col={col_idx}, valor={repr(value)}"
+                    )
+
+        if not found_cells:
+            lines.append("  No se han encontrado celdas CO2 con búsqueda simple.")
+
+        # Buscar filas relevantes
+        lines.append("")
+        lines.append("Filas donde aparece CO2 / CO₂ / dióxido / carbono:")
+        found_rows = False
+
+        for row_idx in range(df_raw.shape[0]):
+            row_text = safe_row_to_text(df_raw.iloc[row_idx, :])
+
+            if (
+                "co2" in row_text
+                or "dioxido" in row_text
+                or "carbono" in row_text
+                or "carbon dioxide" in row_text
+            ):
+                found_rows = True
+                lines.append("")
+                lines.append(f"Fila {row_idx}:")
+                lines.append(df_raw.iloc[row_idx, :60].to_string())
+
+        if not found_rows:
+            lines.append("  No se han encontrado filas CO2 con búsqueda simple.")
+
+    except Exception as e:
+        lines.append("")
+        lines.append("Error leyendo sin cabecera:")
+        lines.append(str(e))
+
+
+def main():
+    if not XLSX_PATH.exists():
+        raise FileNotFoundError(f"No encuentro el Excel de MITECO: {XLSX_PATH}")
+
+    lines = []
+
+    lines.append("INSPECCIÓN DETALLADA CO2 MITECO")
+    lines.append(f"Archivo: {XLSX_PATH}")
+    lines.append("")
+
+    for sheet_name in SHEETS_TO_CHECK:
+        inspect_sheet(sheet_name, lines)
+        lines.append("")
+
+    OUT_TXT.write_text("\n".join(lines), encoding="utf-8")
+
+    print("Informe generado correctamente:")
+    print(OUT_TXT)
+
+    print("\nHojas inspeccionadas:")
+    for sheet_name in SHEETS_TO_CHECK:
+        print(f"- {sheet_name}")
+
+    print("\nAbre este archivo y pégame las partes de:")
+    print("- Columnas detectadas")
+    print("- Columnas que parecen relacionadas con CO2")
+    print("- Celdas donde aparece CO2 / CO₂ / dióxido / carbono")
+
+
+if __name__ == "__main__":
+    main()

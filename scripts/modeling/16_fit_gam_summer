@@ -1,0 +1,494 @@
+from pathlib import Path
+import sqlite3
+import sys
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# =========================
+# COMPROBAR PYGAM
+# =========================
+
+try:
+    from pygam import LinearGAM, s, f
+except ImportError:
+    print("ERROR: No tienes instalado pygam.")
+    print("Instálalo con:")
+    print(r".\.venv\Scripts\python.exe -m pip install pygam")
+    sys.exit(1)
+
+
+# =========================
+# CONFIGURACIÓN
+# =========================
+
+DB_PATH = Path("data/db/master_energy.sqlite")
+
+OUT_DIR = Path("outputs/modeling/gam_summer")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+OUT_PRED = OUT_DIR / "gam_summer_predictions_2021_2025.csv"
+
+PLOT_EFFECT_TEMP = OUT_DIR / "01_gam_summer_temperature_effect.png"
+PLOT_OBS_PRED = OUT_DIR / "02_gam_summer_observed_vs_predicted.png"
+PLOT_MONTHLY_TEST = OUT_DIR / "03_gam_summer_monthly_test_observed_vs_predicted.png"
+
+TRAIN_END_YEAR = 2020
+TEST_START_YEAR = 2021
+
+LOW_DEMAND_THRESHOLD = 15000
+
+
+# =========================
+# FUNCIONES DE MÉTRICAS
+# =========================
+
+def rmse(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return np.sqrt(np.mean((y_true - y_pred) ** 2))
+
+
+def mae(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return np.mean(np.abs(y_true - y_pred))
+
+
+def r2_score_manual(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+
+    return 1 - ss_res / ss_tot
+
+
+def evaluate_model(name, y_train, pred_train, y_test, pred_test):
+    return {
+        "model": name,
+        "r2_train": r2_score_manual(y_train, pred_train),
+        "r2_test": r2_score_manual(y_test, pred_test),
+        "rmse_train_mw": rmse(y_train, pred_train),
+        "rmse_test_mw": rmse(y_test, pred_test),
+        "mae_train_mw": mae(y_train, pred_train),
+        "mae_test_mw": mae(y_test, pred_test),
+    }
+
+
+# =========================
+# MODELO BASE POLINÓMICO
+# =========================
+
+def fit_linear_baseline(train, test):
+    """
+    Modelo base:
+    demand_mw = temp_c + temp_c^2 + tendencia + hora + día semana + mes
+
+    Esto sirve como comparación frente al GAM.
+    """
+
+    base = pd.concat(
+        [
+            train.assign(split="train"),
+            test.assign(split="test"),
+        ],
+        ignore_index=True,
+    )
+
+    base["temp_c2"] = base["temp_c"] ** 2
+
+    features = [
+        "temp_c",
+        "temp_c2",
+        "time_index_years",
+        "hour",
+        "day_of_week",
+        "month",
+    ]
+
+    X = pd.get_dummies(
+        base[features],
+        columns=["hour", "day_of_week", "month"],
+        drop_first=True,
+        dtype=float,
+    )
+
+    X.insert(0, "intercept", 1.0)
+
+    y = base["demand_mw"].to_numpy()
+
+    train_mask = base["split"].eq("train").to_numpy()
+    test_mask = base["split"].eq("test").to_numpy()
+
+    X_train = X.loc[train_mask].to_numpy()
+    y_train = y[train_mask]
+
+    X_test = X.loc[test_mask].to_numpy()
+
+    beta, *_ = np.linalg.lstsq(X_train, y_train, rcond=None)
+
+    pred_train = X_train @ beta
+    pred_test = X_test @ beta
+
+    return pred_train, pred_test
+
+
+# =========================
+# SCRIPT PRINCIPAL
+# =========================
+
+def main():
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"No encuentro la base de datos: {DB_PATH}")
+
+    query = """
+    SELECT
+        d.timestamp_utc,
+        d.demand_mw,
+        t.temp_c
+    FROM demand_peninsula_hourly d
+    INNER JOIN temperature_peninsula_hourly t
+        ON d.timestamp_utc = t.timestamp_utc
+    ORDER BY d.timestamp_utc
+    """
+
+    print("Leyendo datos desde SQLite...")
+
+    with sqlite3.connect(DB_PATH) as conn:
+        df = pd.read_sql_query(query, conn)
+
+    print(f"Filas leídas totales: {len(df):,}")
+
+    # =========================
+    # VARIABLES TEMPORALES
+    # =========================
+
+    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
+
+    df["year"] = df["timestamp_utc"].dt.year
+    df["month"] = df["timestamp_utc"].dt.month
+    df["hour"] = df["timestamp_utc"].dt.hour
+    df["day_of_week"] = df["timestamp_utc"].dt.dayofweek
+    df["date"] = df["timestamp_utc"].dt.date.astype(str)
+
+    df["time_index_years"] = (
+        (df["timestamp_utc"] - df["timestamp_utc"].min())
+        .dt.total_seconds()
+        / (365.25 * 24 * 3600)
+    )
+
+    # =========================
+    # FILTRAR VERANO
+    # =========================
+
+    df_summer = df[df["month"].isin([6, 7, 8])].copy()
+
+    print(f"Filas verano antes de filtrar demanda baja: {len(df_summer):,}")
+
+    low_demand = df_summer[df_summer["demand_mw"] <= LOW_DEMAND_THRESHOLD].copy()
+
+    print(
+        f"Valores verano con demanda <= {LOW_DEMAND_THRESHOLD} MW: "
+        f"{len(low_demand):,}"
+    )
+
+    if len(low_demand) > 0:
+        print("\nPrimeros valores de verano excluidos por demanda sospechosa:")
+        print(
+            low_demand[
+                ["timestamp_utc", "demand_mw", "temp_c"]
+            ].head(10).to_string(index=False)
+        )
+
+    df_summer = df_summer[df_summer["demand_mw"] > LOW_DEMAND_THRESHOLD].copy()
+
+    print(f"Filas verano tras filtrado: {len(df_summer):,}")
+
+    # Junio = 0, julio = 1, agosto = 2
+    df_summer["month_cat"] = df_summer["month"] - 6
+
+    # =========================
+    # SPLIT TEMPORAL
+    # =========================
+
+    train = df_summer[df_summer["year"] <= TRAIN_END_YEAR].copy()
+    test = df_summer[df_summer["year"] >= TEST_START_YEAR].copy()
+
+    print("\nSplit temporal:")
+    print(
+        f"- Train: {train['year'].min()}-{train['year'].max()} "
+        f"| filas: {len(train):,}"
+    )
+    print(
+        f"- Test:  {test['year'].min()}-{test['year'].max()} "
+        f"| filas: {len(test):,}"
+    )
+
+    y_train = train["demand_mw"].to_numpy()
+    y_test = test["demand_mw"].to_numpy()
+
+    results = []
+
+    # =========================
+    # MODELO 1: BASE POLINÓMICO + CALENDARIO
+    # =========================
+
+    print("\nAjustando modelo base polinómico grado 2 + calendario...")
+
+    pred_base_train, pred_base_test = fit_linear_baseline(train, test)
+
+    results.append(
+        evaluate_model(
+            "baseline_poly2_calendar",
+            y_train,
+            pred_base_train,
+            y_test,
+            pred_base_test,
+        )
+    )
+
+    # =========================
+    # MODELO 2: GAM SIN TENDENCIA
+    # =========================
+
+    print("\nAjustando GAM verano sin tendencia...")
+
+    X_train_gam_1 = train[
+        ["temp_c", "hour", "day_of_week", "month_cat"]
+    ].to_numpy()
+
+    X_test_gam_1 = test[
+        ["temp_c", "hour", "day_of_week", "month_cat"]
+    ].to_numpy()
+
+    gam_1 = LinearGAM(
+        s(0, n_splines=15)  # temperatura
+        + f(1)              # hora
+        + f(2)              # día de la semana
+        + f(3)              # mes de verano
+    )
+
+    gam_1.fit(X_train_gam_1, y_train)
+
+    pred_gam1_train = gam_1.predict(X_train_gam_1)
+    pred_gam1_test = gam_1.predict(X_test_gam_1)
+
+    results.append(
+        evaluate_model(
+            "gam_temp_spline_calendar",
+            y_train,
+            pred_gam1_train,
+            y_test,
+            pred_gam1_test,
+        )
+    )
+
+    # =========================
+    # MODELO 3: GAM CON TENDENCIA TEMPORAL
+    # =========================
+
+    print("\nAjustando GAM verano con tendencia temporal...")
+
+    X_train_gam_2 = train[
+        ["temp_c", "hour", "day_of_week", "month_cat", "time_index_years"]
+    ].to_numpy()
+
+    X_test_gam_2 = test[
+        ["temp_c", "hour", "day_of_week", "month_cat", "time_index_years"]
+    ].to_numpy()
+
+    gam_2 = LinearGAM(
+        s(0, n_splines=15)    # temperatura
+        + f(1)                # hora
+        + f(2)                # día de la semana
+        + f(3)                # mes de verano
+        + s(4, n_splines=12)  # tendencia temporal
+    )
+
+    gam_2.fit(X_train_gam_2, y_train)
+
+    pred_gam2_train = gam_2.predict(X_train_gam_2)
+    pred_gam2_test = gam_2.predict(X_test_gam_2)
+
+    results.append(
+        evaluate_model(
+            "gam_temp_spline_calendar_trend",
+            y_train,
+            pred_gam2_train,
+            y_test,
+            pred_gam2_test,
+        )
+    )
+
+    # =========================
+    # TABLA DE MÉTRICAS
+    # =========================
+
+    metrics = pd.DataFrame(results)
+
+    print("\nComparación de modelos:")
+    print(metrics.to_string(index=False))
+
+    metrics_path = OUT_DIR / "gam_summer_model_metrics.csv"
+    metrics.to_csv(metrics_path, index=False, encoding="utf-8")
+
+    # =========================
+    # GUARDAR PREDICCIONES TEST
+    # =========================
+
+    test_out = test.copy()
+    test_out["pred_baseline_poly2_calendar"] = pred_base_test
+    test_out["pred_gam_temp_spline_calendar"] = pred_gam1_test
+    test_out["pred_gam_temp_spline_calendar_trend"] = pred_gam2_test
+    test_out["residual_gam_trend"] = (
+        test_out["demand_mw"]
+        - test_out["pred_gam_temp_spline_calendar_trend"]
+    )
+
+    test_out.to_csv(OUT_PRED, index=False, encoding="utf-8")
+
+    # =========================
+    # GRÁFICO 1: EFECTO TEMPERATURA GAM
+    # =========================
+
+    temp_min = df_summer["temp_c"].quantile(0.01)
+    temp_max = df_summer["temp_c"].quantile(0.99)
+
+    temp_grid = np.linspace(temp_min, temp_max, 200)
+
+    # Mantenemos el resto fijo:
+    # hora 14 UTC, miércoles, julio, mitad del periodo temporal.
+    X_grid = np.column_stack(
+        [
+            temp_grid,
+            np.full_like(temp_grid, 14),  # hour
+            np.full_like(temp_grid, 2),   # Wednesday
+            np.full_like(temp_grid, 1),   # July
+            np.full_like(temp_grid, train["time_index_years"].median()),
+        ]
+    )
+
+    temp_effect = gam_2.partial_dependence(term=0, X=X_grid)
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+
+    ax.plot(temp_grid, temp_effect, linewidth=2)
+    ax.axhline(0, linestyle="--", linewidth=1, alpha=0.6)
+
+    ax.set_title(
+        "GAM verano: efecto parcial de la temperatura\n"
+        "Controlando hora, día de semana, mes y tendencia"
+    )
+    ax.set_xlabel("Temperatura peninsular media horaria (ºC)")
+    ax.set_ylabel("Efecto parcial sobre demanda (MW)")
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(PLOT_EFFECT_TEMP, dpi=200)
+    plt.close(fig)
+
+    # =========================
+    # GRÁFICO 2: OBSERVADO VS PREDICHO TEST
+    # =========================
+
+    fig, ax = plt.subplots(figsize=(6, 6))
+
+    ax.scatter(
+        test_out["demand_mw"],
+        test_out["pred_gam_temp_spline_calendar_trend"],
+        s=6,
+        alpha=0.25,
+    )
+
+    min_val = min(
+        test_out["demand_mw"].min(),
+        test_out["pred_gam_temp_spline_calendar_trend"].min(),
+    )
+
+    max_val = max(
+        test_out["demand_mw"].max(),
+        test_out["pred_gam_temp_spline_calendar_trend"].max(),
+    )
+
+    ax.plot([min_val, max_val], [min_val, max_val], linewidth=1)
+
+    ax.set_title("Verano test 2021-2025: observado vs predicho")
+    ax.set_xlabel("Demanda observada (MW)")
+    ax.set_ylabel("Demanda predicha GAM (MW)")
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    fig.savefig(PLOT_OBS_PRED, dpi=200)
+    plt.close(fig)
+
+    # =========================
+    # GRÁFICO 3: MEDIA MENSUAL TEST
+    # =========================
+
+    test_out["year_month"] = (
+        test_out["year"].astype(str)
+        + "-"
+        + test_out["month"].astype(str).str.zfill(2)
+    )
+
+    monthly = (
+        test_out
+        .groupby("year_month", as_index=False)
+        .agg(
+            observed_mw=("demand_mw", "mean"),
+            predicted_mw=("pred_gam_temp_spline_calendar_trend", "mean"),
+        )
+    )
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+
+    ax.plot(
+        monthly["year_month"],
+        monthly["observed_mw"],
+        marker="o",
+        label="Observado",
+    )
+
+    ax.plot(
+        monthly["year_month"],
+        monthly["predicted_mw"],
+        marker="o",
+        label="Predicho GAM",
+    )
+
+    ax.set_title("Verano test 2021-2025: media mensual observada vs predicha")
+    ax.set_xlabel("Mes")
+    ax.set_ylabel("Demanda media (MW)")
+    ax.tick_params(axis="x", rotation=45)
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    fig.tight_layout()
+    fig.savefig(PLOT_MONTHLY_TEST, dpi=200)
+    plt.close(fig)
+
+    # =========================
+    # SALIDA FINAL
+    # =========================
+
+    print("\nArchivos generados:")
+    print(f"- Métricas: {metrics_path}")
+    print(f"- Predicciones test: {OUT_PRED}")
+    print(f"- Gráfico efecto temperatura: {PLOT_EFFECT_TEMP}")
+    print(f"- Gráfico observado vs predicho: {PLOT_OBS_PRED}")
+    print(f"- Gráfico mensual test: {PLOT_MONTHLY_TEST}")
+
+    print("\nNota:")
+    print(
+        "Este primer GAM está ajustado solo para verano. "
+        "Si el resultado es razonable, el siguiente paso será probar "
+        "el mismo enfoque por estación o con curvas de temperatura separadas."
+    )
+
+
+if __name__ == "__main__":
+    main()

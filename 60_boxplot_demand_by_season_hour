@@ -1,0 +1,41 @@
+import sqlite3
+import pandas as pd
+import matplotlib.pyplot as plt
+
+DB_PATH = r"data\db\master_energy.sqlite"
+
+season_case = """
+CASE
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (12, 1, 2) THEN 'Invierno'
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (3, 4, 5) THEN 'Primavera'
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (6, 7, 8) THEN 'Verano'
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (9,10,11) THEN 'Otoño'
+END
+"""
+
+con = sqlite3.connect(DB_PATH)
+
+df = pd.read_sql(f"""
+SELECT
+  {season_case} AS season,
+  CAST(substr(timestamp_utc, 12, 2) AS INTEGER) AS hour,
+  demand_mw
+FROM demand_peninsula_hourly;
+""", con)
+
+con.close()
+
+seasons = ["Invierno", "Primavera", "Verano", "Otoño"]
+
+for s in seasons:
+    d = df[df["season"] == s]
+    data = [d[d["hour"] == h]["demand_mw"].values for h in range(24)]
+
+    plt.figure(figsize=(12,5))
+    plt.boxplot(data, showfliers=False)
+    plt.title(f"Demanda (MW) - Boxplot por hora del día - {s}")
+    plt.xlabel("Hora del día")
+    plt.ylabel("Demanda (MW)")
+    plt.xticks(range(1,25), [str(h) for h in range(24)])
+    plt.tight_layout()
+    plt.show()

@@ -1,0 +1,50 @@
+from pathlib import Path
+import sqlite3
+import pandas as pd
+
+
+DB_PATH = Path("data/db/master_energy.sqlite")
+OUT_DIR = Path("outputs/data_quality")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+THRESHOLD_MW = 15000
+
+
+def main():
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"No encuentro la base de datos en: {DB_PATH}")
+
+    query = f"""
+    SELECT
+        d.timestamp_utc,
+        d.demand_mw,
+        d.source AS demand_source,
+        t.temp_c,
+        t.source AS temp_source
+    FROM demand_peninsula_hourly d
+    INNER JOIN temperature_peninsula_hourly t
+        ON d.timestamp_utc = t.timestamp_utc
+    WHERE d.demand_mw <= {THRESHOLD_MW}
+    ORDER BY d.demand_mw ASC, d.timestamp_utc ASC
+    """
+
+    with sqlite3.connect(DB_PATH) as conn:
+        df = pd.read_sql_query(query, conn)
+
+    print(f"Valores con demanda <= {THRESHOLD_MW} MW: {len(df)}")
+
+    if len(df) > 0:
+        print("\nPrimeros valores sospechosos:")
+        print(df.head(50).to_string(index=False))
+
+        out_path = OUT_DIR / f"low_demand_values_le_{THRESHOLD_MW}_mw.csv"
+        df.to_csv(out_path, index=False)
+
+        print(f"\nArchivo generado:")
+        print(f"- {out_path}")
+    else:
+        print("No se han encontrado valores sospechosamente bajos.")
+
+
+if __name__ == "__main__":
+    main()

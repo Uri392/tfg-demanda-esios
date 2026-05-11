@@ -1,0 +1,81 @@
+import sqlite3
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+DB_PATH = r"data\db\master_energy.sqlite"
+MIN_COUNT = 200
+
+con = sqlite3.connect(DB_PATH)
+
+df = pd.read_sql("""
+SELECT d.demand_mw AS demand_mw,
+       t.temp_c AS temp_c
+FROM demand_peninsula_hourly d
+JOIN temperature_peninsula_hourly t
+  ON d.timestamp_utc = t.timestamp_utc;
+""", con)
+
+con.close()
+
+df = df.dropna(subset=["demand_mw", "temp_c"])
+df["demand_mw"] = pd.to_numeric(df["demand_mw"], errors="coerce")
+df["temp_c"] = pd.to_numeric(df["temp_c"], errors="coerce")
+df = df.dropna(subset=["demand_mw", "temp_c"])
+
+# bins de 1°C
+tmin = np.floor(df["temp_c"].min())
+tmax = np.ceil(df["temp_c"].max())
+bins = np.arange(tmin, tmax + 1, 1)
+
+df["temp_bin"] = pd.cut(df["temp_c"], bins=bins, include_lowest=True)
+df["temp_mid"] = df["temp_bin"].apply(lambda x: (x.left + x.right)/2)
+
+# Agregar por bin y filtrar por conteo
+g = df.groupby("temp_mid")["demand_mw"].agg(mean="mean", count="count").reset_index()
+g = g[g["count"] >= MIN_COUNT].copy()
+
+x = g["temp_mid"].values
+y = g["mean"].values
+
+# ---------- Ajuste lineal ----------
+coef_lin = np.polyfit(x, y, deg=1)
+y_lin = np.polyval(coef_lin, x)
+
+# ---------- Ajuste cuadrático ----------
+coef_quad = np.polyfit(x, y, deg=2)
+y_quad = np.polyval(coef_quad, x)
+
+def r2(y_true, y_pred):
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    return 1 - ss_res / ss_tot
+
+r2_lin = r2(y, y_lin)
+r2_quad = r2(y, y_quad)
+
+print("=== AJUSTES SOBRE BINS (count >= %d) ===" % MIN_COUNT)
+print("N bins usados:", len(g))
+print("\nLineal: y = a*T + b")
+print("a, b =", coef_lin)
+print("R^2 lineal =", round(r2_lin, 4))
+
+print("\nCuadrático: y = a*T^2 + b*T + c")
+print("a, b, c =", coef_quad)
+print("R^2 cuadrático =", round(r2_quad, 4))
+
+# Para dibujar curvas suaves
+x_smooth = np.linspace(x.min(), x.max(), 300)
+y_lin_s = np.polyval(coef_lin, x_smooth)
+y_quad_s = np.polyval(coef_quad, x_smooth)
+
+plt.figure(figsize=(9,5))
+plt.scatter(x, y, s=25, alpha=0.7, label="Bins (media por 1°C)")
+plt.plot(x_smooth, y_lin_s, label=f"Ajuste lineal (R²={r2_lin:.3f})")
+plt.plot(x_smooth, y_quad_s, label=f"Ajuste cuadrático (R²={r2_quad:.3f})")
+plt.title("Demanda vs Temperatura: ajuste lineal vs cuadrático (bins robustos)")
+plt.xlabel("Temperatura (°C) (centro del bin)")
+plt.ylabel("Demanda media (MW)")
+plt.legend()
+plt.tight_layout()
+plt.show()

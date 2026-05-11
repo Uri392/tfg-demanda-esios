@@ -1,0 +1,593 @@
+from pathlib import Path
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# =============================================================================
+# CONFIGURACIÓN
+# =============================================================================
+
+LOCAL_TZ = "Europe/Madrid"
+
+# Este es el CSV correcto: el de predicciones del mejor modelo por estación.
+# Evitamos que el script coja automáticamente el CSV de "all_models".
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+PREDICTIONS_CSV = (
+    PROJECT_ROOT
+    / "outputs/modeling/gam_seasonal_clean/22_test_predictions_best_model_by_season.csv"
+)
+
+OUT_DIR = PROJECT_ROOT / "outputs/modeling/gam_observed_vs_predicted"
+PLOTS_DIR = OUT_DIR / "plots"
+
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+PLOTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# =============================================================================
+# FUNCIONES AUXILIARES
+# =============================================================================
+
+def find_column(df, candidates, required=True):
+    """
+    Busca una columna en df a partir de una lista de nombres posibles.
+    No distingue entre mayúsculas y minúsculas.
+    """
+    cols_lower = {c.lower(): c for c in df.columns}
+
+    for candidate in candidates:
+        if candidate.lower() in cols_lower:
+            return cols_lower[candidate.lower()]
+
+    if required:
+        raise ValueError(
+            "No se ha encontrado ninguna de estas columnas: "
+            + ", ".join(candidates)
+            + f"\nColumnas disponibles: {list(df.columns)}"
+        )
+
+    return None
+
+
+def parse_timestamp_column(series, col_name):
+    """
+    Convierte una columna temporal a timestamp local sin zona horaria.
+
+    Corrección importante:
+    - timestamp_madrid puede venir con offsets mezclados, por ejemplo +01:00 y +02:00.
+    - Pandas falla si intentamos convertir directamente timestamps con zonas mezcladas.
+    - Por eso, si detectamos zona horaria, primero convertimos a UTC y después a Europe/Madrid.
+    """
+    s = series.astype(str)
+
+    # Detecta valores tipo:
+    # 2021-06-01 00:00:00+02:00
+    # 2021-06-01T00:00:00Z
+    has_timezone_info = s.str.contains(
+        r"(Z|[+-]\d{2}:?\d{2})$",
+        regex=True,
+        na=False
+    ).any()
+
+    col_lower = col_name.lower()
+
+    if has_timezone_info or "utc" in col_lower:
+        timestamp = (
+            pd.to_datetime(series, errors="coerce", utc=True)
+            .dt.tz_convert(LOCAL_TZ)
+            .dt.tz_localize(None)
+        )
+    else:
+        # Si no hay zona horaria explícita, lo tratamos como fecha local naive.
+        timestamp = pd.to_datetime(series, errors="coerce")
+
+    return timestamp
+
+
+def season_from_month(month):
+    if month in [12, 1, 2]:
+        return "DJF"
+    if month in [3, 4, 5]:
+        return "MAM"
+    if month in [6, 7, 8]:
+        return "JJA"
+    if month in [9, 10, 11]:
+        return "SON"
+    return np.nan
+
+
+def calculate_metrics(data, observed_col, predicted_col):
+    """
+    Calcula métricas básicas entre observado y predicho.
+    El error se define como:
+        error = predicho - observado
+    """
+    d = data[[observed_col, predicted_col]].dropna().copy()
+
+    if len(d) == 0:
+        return pd.Series({
+            "n_obs": 0,
+            "observed_mean_mw": np.nan,
+            "predicted_mean_mw": np.nan,
+            "bias_mean_mw": np.nan,
+            "mae_mw": np.nan,
+            "rmse_mw": np.nan,
+            "r2": np.nan,
+            "median_abs_error_mw": np.nan,
+            "p90_abs_error_mw": np.nan,
+            "observed_min_mw": np.nan,
+            "observed_max_mw": np.nan,
+            "predicted_min_mw": np.nan,
+            "predicted_max_mw": np.nan,
+        })
+
+    y_true = d[observed_col].astype(float).to_numpy()
+    y_pred = d[predicted_col].astype(float).to_numpy()
+
+    error = y_pred - y_true
+    abs_error = np.abs(error)
+
+    ss_res = np.sum(error ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+
+    if ss_tot == 0:
+        r2 = np.nan
+    else:
+        r2 = 1 - ss_res / ss_tot
+
+    return pd.Series({
+        "n_obs": len(d),
+        "observed_mean_mw": np.mean(y_true),
+        "predicted_mean_mw": np.mean(y_pred),
+        "bias_mean_mw": np.mean(error),
+        "mae_mw": np.mean(abs_error),
+        "rmse_mw": np.sqrt(np.mean(error ** 2)),
+        "r2": r2,
+        "median_abs_error_mw": np.median(abs_error),
+        "p90_abs_error_mw": np.percentile(abs_error, 90),
+        "observed_min_mw": np.min(y_true),
+        "observed_max_mw": np.max(y_true),
+        "predicted_min_mw": np.min(y_pred),
+        "predicted_max_mw": np.max(y_pred),
+    })
+
+
+def save_group_metrics(df, group_cols, observed_col, predicted_col, filename):
+    """
+    Calcula métricas por grupo y las guarda en CSV.
+    """
+    metrics = (
+        df.groupby(group_cols, dropna=False)
+        .apply(lambda g: calculate_metrics(g, observed_col, predicted_col))
+        .reset_index()
+    )
+
+    out_path = OUT_DIR / filename
+    metrics.to_csv(out_path, index=False, encoding="utf-8-sig")
+    print(f"Guardado: {out_path}")
+
+    return metrics
+
+
+def plot_observed_vs_predicted_scatter(df, observed_col, predicted_col):
+    """
+    Gráfico horario observado vs predicho.
+    """
+    d = df[[observed_col, predicted_col]].dropna().copy()
+
+    plt.figure(figsize=(8, 8))
+    plt.scatter(d[observed_col], d[predicted_col], alpha=0.25, s=8)
+
+    min_val = min(d[observed_col].min(), d[predicted_col].min())
+    max_val = max(d[observed_col].max(), d[predicted_col].max())
+
+    plt.plot([min_val, max_val], [min_val, max_val], linewidth=2)
+
+    plt.title("Demanda observada vs predicha por el GAM")
+    plt.xlabel("Demanda observada (MW)")
+    plt.ylabel("Demanda predicha GAM (MW)")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    out_path = PLOTS_DIR / "01_observed_vs_predicted_scatter.png"
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+    print(f"Guardado: {out_path}")
+
+
+def plot_monthly_observed_vs_predicted(df, observed_col, predicted_col):
+    """
+    Comparación mensual observada vs predicha.
+    """
+    if "year_month" not in df.columns:
+        return
+
+    monthly = (
+        df.groupby("year_month", dropna=False)
+        .agg(
+            observed_mean_mw=(observed_col, "mean"),
+            predicted_mean_mw=(predicted_col, "mean")
+        )
+        .reset_index()
+    )
+
+    monthly = monthly.dropna(subset=["year_month"])
+    monthly["year_month"] = monthly["year_month"].astype(str)
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(monthly["year_month"], monthly["observed_mean_mw"], marker="o", label="Observado")
+    plt.plot(monthly["year_month"], monthly["predicted_mean_mw"], marker="o", label="Predicho GAM")
+
+    plt.title("Media mensual observada vs predicha por el GAM")
+    plt.xlabel("Mes")
+    plt.ylabel("Demanda media (MW)")
+    plt.xticks(rotation=45)
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    out_path = PLOTS_DIR / "02_monthly_observed_vs_predicted.png"
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+    print(f"Guardado: {out_path}")
+
+
+def plot_error_distribution(df):
+    """
+    Histograma de errores.
+    """
+    d = df["error_mw"].dropna()
+
+    plt.figure(figsize=(9, 5))
+    plt.hist(d, bins=80)
+
+    plt.axvline(0, linewidth=2)
+    plt.title("Distribución del error del GAM")
+    plt.xlabel("Error = predicho - observado (MW)")
+    plt.ylabel("Frecuencia")
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+
+    out_path = PLOTS_DIR / "03_error_distribution.png"
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+    print(f"Guardado: {out_path}")
+
+
+def plot_metrics_by_season(metrics_by_season):
+    """
+    Gráfico RMSE y MAE por estación.
+    """
+    if metrics_by_season.empty:
+        return
+
+    seasons_order = ["DJF", "MAM", "JJA", "SON"]
+    d = metrics_by_season.copy()
+    d["season_order"] = d["season"].map({s: i for i, s in enumerate(seasons_order)})
+    d = d.sort_values("season_order")
+
+    x = np.arange(len(d))
+    width = 0.35
+
+    plt.figure(figsize=(8, 5))
+    plt.bar(x - width / 2, d["rmse_mw"], width, label="RMSE")
+    plt.bar(x + width / 2, d["mae_mw"], width, label="MAE")
+
+    plt.xticks(x, d["season"])
+    plt.title("Error del GAM por estación")
+    plt.xlabel("Estación")
+    plt.ylabel("Error (MW)")
+    plt.grid(True, axis="y", alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    out_path = PLOTS_DIR / "04_error_metrics_by_season.png"
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+    print(f"Guardado: {out_path}")
+
+
+def plot_weekly_timeseries(df, observed_col, predicted_col):
+    """
+    Serie temporal semanal observada vs predicha.
+    """
+    if "timestamp" not in df.columns:
+        return
+
+    d = df.dropna(subset=["timestamp", observed_col, predicted_col]).copy()
+
+    if d.empty:
+        return
+
+    d = d.set_index("timestamp").sort_index()
+
+    weekly = d[[observed_col, predicted_col]].resample("W").mean().dropna()
+
+    plt.figure(figsize=(12, 5))
+    plt.plot(weekly.index, weekly[observed_col], label="Observado")
+    plt.plot(weekly.index, weekly[predicted_col], label="Predicho GAM")
+
+    plt.title("Demanda observada vs predicha por el GAM - media semanal")
+    plt.xlabel("Fecha")
+    plt.ylabel("Demanda media semanal (MW)")
+    plt.grid(True, alpha=0.3)
+    plt.legend()
+    plt.tight_layout()
+
+    out_path = PLOTS_DIR / "05_weekly_observed_vs_predicted.png"
+    plt.savefig(out_path, dpi=200)
+    plt.close()
+
+    print(f"Guardado: {out_path}")
+
+
+# =============================================================================
+# SCRIPT PRINCIPAL
+# =============================================================================
+
+def main():
+    print("=" * 100)
+    print("COMPARACIÓN ENTRE DEMANDA OBSERVADA Y PREDICHA POR EL GAM")
+    print("=" * 100)
+
+    if not PREDICTIONS_CSV.exists():
+        raise FileNotFoundError(
+            f"No se ha encontrado el archivo:\n{PREDICTIONS_CSV}\n\n"
+            "Comprueba que existe este CSV:\n"
+            "outputs/modeling/gam_seasonal_clean/22_test_predictions_best_model_by_season.csv"
+        )
+
+    print(f"\nLeyendo archivo:\n{PREDICTIONS_CSV}\n")
+
+    df = pd.read_csv(PREDICTIONS_CSV)
+    df.columns = [c.strip() for c in df.columns]
+
+    print("Columnas detectadas:")
+    for c in df.columns:
+        print(f"- {c}")
+
+    observed_col = find_column(
+        df,
+        [
+            "observed_mw",
+            "demand_mw",
+            "load_mw",
+            "y_true",
+            "observed",
+            "demanda_observada_mw",
+        ],
+        required=True,
+    )
+
+    predicted_col = find_column(
+        df,
+        [
+            "predicted_mw",
+            "prediction_mw",
+            "y_pred",
+            "predicted",
+            "demanda_predicha_mw",
+        ],
+        required=True,
+    )
+
+    time_col = find_column(
+        df,
+        [
+            "timestamp_madrid",
+            "timestamp_local",
+            "timestamp_utc",
+            "timestamp",
+            "datetime",
+            "date",
+        ],
+        required=False,
+    )
+
+    season_col = find_column(
+        df,
+        ["season", "estacion"],
+        required=False,
+    )
+
+    model_col = find_column(
+        df,
+        ["model", "modelo"],
+        required=False,
+    )
+
+    print("\nColumnas usadas:")
+    print(f"- Observado: {observed_col}")
+    print(f"- Predicho GAM: {predicted_col}")
+    print(f"- Tiempo: {time_col}")
+    print(f"- Estación: {season_col}")
+    print(f"- Modelo: {model_col}")
+
+    # -------------------------------------------------------------------------
+    # Conversión de tipos
+    # -------------------------------------------------------------------------
+
+    df[observed_col] = pd.to_numeric(df[observed_col], errors="coerce")
+    df[predicted_col] = pd.to_numeric(df[predicted_col], errors="coerce")
+
+    if time_col is not None:
+        df["timestamp"] = parse_timestamp_column(df[time_col], time_col)
+    else:
+        df["timestamp"] = pd.NaT
+
+    # -------------------------------------------------------------------------
+    # Variables temporales
+    # -------------------------------------------------------------------------
+
+    if df["timestamp"].notna().any():
+        df["local_year"] = df["timestamp"].dt.year
+        df["local_month"] = df["timestamp"].dt.month
+        df["local_hour"] = df["timestamp"].dt.hour
+        df["local_day_of_week"] = df["timestamp"].dt.dayofweek
+        df["local_date"] = df["timestamp"].dt.date
+        df["year_month"] = df["timestamp"].dt.to_period("M").astype(str)
+    else:
+        # Si por algún motivo no se puede leer timestamp, intentamos usar columnas ya existentes.
+        if "local_year" not in df.columns:
+            df["local_year"] = np.nan
+        if "local_month" not in df.columns:
+            df["local_month"] = np.nan
+        if "local_hour" not in df.columns:
+            df["local_hour"] = np.nan
+        if "local_day_of_week" not in df.columns:
+            df["local_day_of_week"] = np.nan
+        if "year_month" not in df.columns:
+            df["year_month"] = np.nan
+
+    if season_col is not None:
+        df["season"] = df[season_col]
+    else:
+        df["season"] = df["local_month"].apply(season_from_month)
+
+    # -------------------------------------------------------------------------
+    # Errores
+    # -------------------------------------------------------------------------
+
+    df["error_mw"] = df[predicted_col] - df[observed_col]
+    df["abs_error_mw"] = df["error_mw"].abs()
+    df["squared_error_mw"] = df["error_mw"] ** 2
+
+    # Limpieza mínima
+    before = len(df)
+    df = df.dropna(subset=[observed_col, predicted_col]).copy()
+    after = len(df)
+
+    print(f"\nFilas iniciales: {before:,}")
+    print(f"Filas válidas con observado y predicho: {after:,}")
+    print(f"Filas eliminadas por NaN en observado/predicho: {before - after:,}")
+
+    # -------------------------------------------------------------------------
+    # Métricas
+    # -------------------------------------------------------------------------
+
+    global_metrics = calculate_metrics(df, observed_col, predicted_col).to_frame().T
+    global_metrics.to_csv(
+        OUT_DIR / "23_metrics_global.csv",
+        index=False,
+        encoding="utf-8-sig",
+    )
+
+    print("\nMétricas globales:")
+    print(global_metrics.to_string(index=False))
+
+    metrics_by_season = save_group_metrics(
+        df,
+        ["season"],
+        observed_col,
+        predicted_col,
+        "23_metrics_by_season.csv",
+    )
+
+    metrics_by_year = save_group_metrics(
+        df,
+        ["local_year"],
+        observed_col,
+        predicted_col,
+        "23_metrics_by_year.csv",
+    )
+
+    metrics_by_month = save_group_metrics(
+        df,
+        ["local_month"],
+        observed_col,
+        predicted_col,
+        "23_metrics_by_month.csv",
+    )
+
+    metrics_by_year_month = save_group_metrics(
+        df,
+        ["year_month"],
+        observed_col,
+        predicted_col,
+        "23_metrics_by_year_month.csv",
+    )
+
+    metrics_by_hour = save_group_metrics(
+        df,
+        ["local_hour"],
+        observed_col,
+        predicted_col,
+        "23_metrics_by_hour.csv",
+    )
+
+    metrics_by_day_of_week = save_group_metrics(
+        df,
+        ["local_day_of_week"],
+        observed_col,
+        predicted_col,
+        "23_metrics_by_day_of_week.csv",
+    )
+
+    if model_col is not None:
+        save_group_metrics(
+            df,
+            [model_col],
+            observed_col,
+            predicted_col,
+            "23_metrics_by_model.csv",
+        )
+
+    # -------------------------------------------------------------------------
+    # Guardar predicciones con errores
+    # -------------------------------------------------------------------------
+
+    out_predictions = OUT_DIR / "23_predictions_with_errors.csv"
+    df.to_csv(out_predictions, index=False, encoding="utf-8-sig")
+    print(f"\nGuardado: {out_predictions}")
+
+    # -------------------------------------------------------------------------
+    # Gráficos
+    # -------------------------------------------------------------------------
+
+    plot_observed_vs_predicted_scatter(df, observed_col, predicted_col)
+    plot_monthly_observed_vs_predicted(df, observed_col, predicted_col)
+    plot_error_distribution(df)
+    plot_metrics_by_season(metrics_by_season)
+    plot_weekly_timeseries(df, observed_col, predicted_col)
+
+    # -------------------------------------------------------------------------
+    # Resumen final
+    # -------------------------------------------------------------------------
+
+    print("\n" + "=" * 100)
+    print("RESUMEN FINAL")
+    print("=" * 100)
+
+    r2 = global_metrics.loc[0, "r2"]
+    rmse = global_metrics.loc[0, "rmse_mw"]
+    mae = global_metrics.loc[0, "mae_mw"]
+    bias = global_metrics.loc[0, "bias_mean_mw"]
+    p90 = global_metrics.loc[0, "p90_abs_error_mw"]
+
+    print(f"R² global test: {r2:.4f}")
+    print(f"RMSE global test: {rmse:.1f} MW")
+    print(f"MAE global test: {mae:.1f} MW")
+    print(f"Bias medio test: {bias:.1f} MW")
+    print(f"P90 error absoluto test: {p90:.1f} MW")
+
+    print("\nArchivos generados en:")
+    print(OUT_DIR)
+
+    print("\nGráficos generados en:")
+    print(PLOTS_DIR)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print("\nERROR:")
+        print(e)
+        sys.exit(1)

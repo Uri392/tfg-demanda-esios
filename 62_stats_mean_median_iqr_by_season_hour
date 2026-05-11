@@ -1,0 +1,72 @@
+import sqlite3
+import pandas as pd
+
+pd.set_option("display.max_rows", 200)
+pd.set_option("display.width", 220)
+
+DB_PATH = r"data\db\master_energy.sqlite"
+
+season_case = """
+CASE
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (12, 1, 2) THEN 'Invierno'
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (3, 4, 5) THEN 'Primavera'
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (6, 7, 8) THEN 'Verano'
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (9,10,11) THEN 'Otoño'
+END
+"""
+
+def load_table(con, table, value_col):
+    df = pd.read_sql(f"""
+    SELECT
+      {season_case} AS season,
+      CAST(substr(timestamp_utc, 12, 2) AS INTEGER) AS hour,
+      {value_col} AS value
+    FROM {table};
+    """, con)
+    return df
+
+def stats_by_season_hour(df, label):
+    g = df.groupby(["season", "hour"])["value"]
+    out = pd.DataFrame({
+        "mean": g.mean(),
+        "median": g.median(),
+        "q1": g.quantile(0.25),
+        "q3": g.quantile(0.75),
+    }).reset_index()
+
+    out["iqr"] = out["q3"] - out["q1"]
+    out["abs_mean_minus_median"] = (out["mean"] - out["median"]).abs()
+
+    # redondeos presentables
+    if label == "temp":
+        out[["mean","median","q1","q3","iqr","abs_mean_minus_median"]] = out[["mean","median","q1","q3","iqr","abs_mean_minus_median"]].round(2)
+    else:
+        out[["mean","median","q1","q3","iqr","abs_mean_minus_median"]] = out[["mean","median","q1","q3","iqr","abs_mean_minus_median"]].round(1)
+
+    out = out.sort_values(["season", "hour"])
+    return out
+
+con = sqlite3.connect(DB_PATH)
+
+# DEMANDA
+df_d = load_table(con, "demand_peninsula_hourly", "demand_mw")
+stats_d = stats_by_season_hour(df_d, label="demand")
+
+# TEMPERATURA
+df_t = load_table(con, "temperature_peninsula_hourly", "temp_c")
+stats_t = stats_by_season_hour(df_t, label="temp")
+
+con.close()
+
+print("\n=== DEMANDA: media/mediana/IQR por estación y hora ===")
+print(stats_d.to_string(index=False))
+
+print("\n=== TEMPERATURA: media/mediana/IQR por estación y hora ===")
+print(stats_t.to_string(index=False))
+
+# Resumen rápido: dónde más difiere media vs mediana
+print("\n=== TOP 10 (DEMANDA) mayor |media - mediana| ===")
+print(stats_d.sort_values("abs_mean_minus_median", ascending=False).head(10).to_string(index=False))
+
+print("\n=== TOP 10 (TEMPERATURA) mayor |media - mediana| ===")
+print(stats_t.sort_values("abs_mean_minus_median", ascending=False).head(10).to_string(index=False))

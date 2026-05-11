@@ -1,0 +1,58 @@
+import sqlite3
+import pandas as pd
+
+pd.set_option("display.max_rows", None)
+pd.set_option("display.width", 200)
+pd.set_option("display.max_rows", 200)
+pd.set_option("display.max_columns", 50)
+pd.set_option("display.width", 300)
+DB_PATH = r"data\db\master_energy.sqlite"
+
+con = sqlite3.connect(DB_PATH)
+
+# Mes -> estación (DJF, MAM, JJA, SON) usando meses completos
+season_case = """
+CASE
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (12, 1, 2) THEN 'Invierno (DJF)'
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (3, 4, 5) THEN 'Primavera (MAM)'
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (6, 7, 8) THEN 'Verano (JJA)'
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (9,10,11) THEN 'Otoño (SON)'
+END
+"""
+
+# DEMANDA
+demand = pd.read_sql(f"""
+SELECT
+  {season_case} AS season,
+  CAST(substr(timestamp_utc, 12, 2) AS INTEGER) AS hour,
+  ROUND(AVG(demand_mw), 1) AS mean_demand_mw
+FROM demand_peninsula_hourly
+GROUP BY season, hour
+ORDER BY season, hour;
+""", con)
+
+# TEMPERATURA
+temp = pd.read_sql(f"""
+SELECT
+  {season_case} AS season,
+  CAST(substr(timestamp_utc, 12, 2) AS INTEGER) AS hour,
+  ROUND(AVG(temp_c), 2) AS mean_temp_c
+FROM temperature_peninsula_hourly
+GROUP BY season, hour
+ORDER BY season, hour;
+""", con)
+
+con.close()
+
+print("\n=== DIA TIPICO POR ESTACION (DEMANDA) ===")
+print(demand.to_string(index=False))
+
+print("\n=== DIA TIPICO POR ESTACION (TEMPERATURA) ===")
+print(temp.to_string(index=False))
+
+# Opcional: versión pivote (más fácil de leer)
+print("\n=== DEMANDA (PIVOTE) filas=hora, columnas=estacion ===")
+print(demand.pivot(index="hour", columns="season", values="mean_demand_mw").to_string())
+
+print("\n=== TEMPERATURA (PIVOTE) filas=hora, columnas=estacion ===")
+print(temp.pivot(index="hour", columns="season", values="mean_temp_c").to_string())

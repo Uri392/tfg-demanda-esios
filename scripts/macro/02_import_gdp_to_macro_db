@@ -1,0 +1,95 @@
+from pathlib import Path
+import shutil
+import sqlite3
+
+import pandas as pd
+
+
+SOURCE_DB = Path("data/db/master_energy.sqlite")
+MACRO_DB = Path("data/db/master_energy_macro.sqlite")
+GDP_CSV = Path("data/external/macro/gdp_spain_ine_2006_2025.csv")
+
+TABLE_NAME = "macro_gdp_spain_annual"
+
+
+def main():
+    if not SOURCE_DB.exists():
+        raise FileNotFoundError(f"No encuentro la base original: {SOURCE_DB}")
+
+    if not GDP_CSV.exists():
+        raise FileNotFoundError(
+            f"No encuentro el CSV de PIB: {GDP_CSV}\n"
+            "Ejecuta antes el script 01_create_gdp_csv_ine.py"
+        )
+
+    # 1) Crear copia de la base si no existe
+    if not MACRO_DB.exists():
+        shutil.copy2(SOURCE_DB, MACRO_DB)
+        print(f"Copia creada: {MACRO_DB}")
+    else:
+        print(f"La base macro ya existe, se reutiliza: {MACRO_DB}")
+
+    # 2) Leer CSV
+    df = pd.read_csv(GDP_CSV)
+
+    expected_cols = {
+        "year",
+        "gdp_current_million_eur",
+        "gdp_volume_index_2020_100",
+        "gdp_volume_growth_pct",
+        "status_ine",
+        "is_provisional",
+        "source",
+        "notes",
+    }
+
+    missing = expected_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Faltan columnas en el CSV: {missing}")
+
+    # 3) Comprobaciones básicas
+    if df["year"].duplicated().any():
+        duplicated_years = df.loc[df["year"].duplicated(), "year"].tolist()
+        raise ValueError(f"Hay años duplicados: {duplicated_years}")
+
+    if df["year"].min() != 2006 or df["year"].max() != 2025:
+        raise ValueError(
+            f"Rango de años inesperado: {df['year'].min()}-{df['year'].max()}"
+        )
+
+    if len(df) != 20:
+        raise ValueError(f"Se esperaban 20 filas, pero hay {len(df)}")
+
+    # 4) Crear/reemplazar tabla en SQLite
+    with sqlite3.connect(MACRO_DB) as conn:
+        cur = conn.cursor()
+
+        cur.execute(f"DROP TABLE IF EXISTS {TABLE_NAME}")
+
+        cur.execute(
+            f"""
+            CREATE TABLE {TABLE_NAME} (
+                year INTEGER PRIMARY KEY,
+                gdp_current_million_eur REAL NOT NULL,
+                gdp_volume_index_2020_100 REAL NOT NULL,
+                gdp_volume_growth_pct REAL,
+                status_ine TEXT,
+                is_provisional INTEGER NOT NULL,
+                source TEXT,
+                notes TEXT
+            )
+            """
+        )
+
+        df.to_sql(TABLE_NAME, conn, if_exists="append", index=False)
+
+        conn.commit()
+
+    print()
+    print(f"Tabla importada correctamente: {TABLE_NAME}")
+    print(f"Base de datos actualizada: {MACRO_DB}")
+    print(f"Filas importadas: {len(df)}")
+
+
+if __name__ == "__main__":
+    main()

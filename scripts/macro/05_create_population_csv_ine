@@ -1,0 +1,153 @@
+from pathlib import Path
+import pandas as pd
+
+
+OUT_DIR = Path("data/external/macro")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+OUT_PATH = OUT_DIR / "population_spain_ine_2006_2025.csv"
+
+INE_CSV_URL = "https://www.ine.es/jaxiT3/files/t/csv_bdsc/56945.csv"
+
+START_YEAR = 2006
+END_YEAR = 2025
+
+
+def normalize_colname(col):
+    return (
+        str(col)
+        .strip()
+        .lower()
+        .replace(" ", "_")
+        .replace("á", "a")
+        .replace("é", "e")
+        .replace("í", "i")
+        .replace("ó", "o")
+        .replace("ú", "u")
+        .replace("ñ", "n")
+    )
+
+
+def main():
+    print("Descargando datos de población desde INE...")
+    print(INE_CSV_URL)
+
+    # El CSV del INE usa separador ;
+    df = pd.read_csv(INE_CSV_URL, sep=";", encoding="utf-8")
+
+    print("\nColumnas originales:")
+    print(list(df.columns))
+
+    df.columns = [normalize_colname(c) for c in df.columns]
+
+    print("\nColumnas normalizadas:")
+    print(list(df.columns))
+
+    # Intentamos detectar la columna de valor.
+    # En los CSV del INE suele llamarse Total.
+    possible_value_cols = ["total", "valor", "value"]
+    value_col = None
+
+    for col in possible_value_cols:
+        if col in df.columns:
+            value_col = col
+            break
+
+    if value_col is None:
+        raise ValueError(
+            "No encuentro la columna de valores. "
+            "Revisa las columnas impresas arriba."
+        )
+
+    required_cols = {"edad_simple", "provincias", "sexo", "periodo", value_col}
+    missing = required_cols - set(df.columns)
+
+    if missing:
+        raise ValueError(
+            f"Faltan columnas esperadas: {missing}\n"
+            f"Columnas disponibles: {list(df.columns)}"
+        )
+
+    # Nos quedamos con:
+    # - Todas las edades
+    # - Total Nacional
+    # - Total
+    # - 1 de enero de cada año
+    df_f = df[
+        (df["edad_simple"].astype(str).str.strip() == "Todas las edades")
+        & (df["provincias"].astype(str).str.strip() == "Total Nacional")
+        & (df["sexo"].astype(str).str.strip() == "Total")
+        & (df["periodo"].astype(str).str.startswith("1 de enero de"))
+    ].copy()
+
+    if df_f.empty:
+        raise ValueError(
+            "El filtrado ha dejado 0 filas. "
+            "Es probable que el nombre de alguna categoría haya cambiado."
+        )
+
+    # Extraer año desde textos tipo: "1 de enero de 2025"
+    df_f["year"] = (
+        df_f["periodo"]
+        .astype(str)
+        .str.extract(r"(\d{4})")[0]
+        .astype(int)
+    )
+
+    df_f = df_f[(df_f["year"] >= START_YEAR) & (df_f["year"] <= END_YEAR)].copy()
+
+    # Limpiar valor por si viene con puntos de miles o comas
+    df_f[value_col] = (
+        df_f[value_col]
+        .astype(str)
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+
+    df_f["population_jan1"] = pd.to_numeric(df_f[value_col], errors="coerce")
+
+    if df_f["population_jan1"].isna().any():
+        bad_rows = df_f[df_f["population_jan1"].isna()]
+        raise ValueError(
+            "Hay valores de población que no se han podido convertir a número:\n"
+            f"{bad_rows.to_string(index=False)}"
+        )
+
+    df_out = pd.DataFrame({
+        "year": df_f["year"],
+        "population_jan1": df_f["population_jan1"].astype(int),
+        "population_date": df_f["periodo"],
+        "status_ine": "definitivo_o_publicado",
+        "is_provisional": 0,
+        "source": "INE - Estadística Continua de Población, tabla 56945",
+        "notes": "Población residente a 1 de enero, Total Nacional, Total sexo, Todas las edades",
+    })
+
+    # Marcamos 2025 con asterisco metodológico, no porque sea malo,
+    # sino porque en nuestro bloque macro 2025 también irá asociado a PIB estimado.
+    df_out.loc[df_out["year"] == 2025, "status_ine"] = "publicado_2025"
+    df_out.loc[df_out["year"] == 2025, "is_provisional"] = 1
+    df_out.loc[df_out["year"] == 2025, "notes"] = (
+        "Población residente a 1 de enero de 2025. "
+        "Se marca como provisional en el bloque macro por coherencia con el PIB 2025 estimado."
+    )
+
+    df_out = df_out.sort_values("year").reset_index(drop=True)
+
+    if len(df_out) != (END_YEAR - START_YEAR + 1):
+        raise ValueError(
+            f"Se esperaban {END_YEAR - START_YEAR + 1} filas, "
+            f"pero se han obtenido {len(df_out)}."
+        )
+
+    df_out.to_csv(OUT_PATH, index=False, encoding="utf-8")
+
+    print("\nCSV de población creado correctamente:")
+    print(OUT_PATH)
+
+    print("\nDatos preparados:")
+    print(df_out.to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()

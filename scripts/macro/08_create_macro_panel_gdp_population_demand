@@ -1,0 +1,256 @@
+from pathlib import Path
+import sqlite3
+
+import pandas as pd
+
+
+MACRO_DB = Path("data/db/master_energy_macro.sqlite")
+OUT_DIR = Path("outputs/macro")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+OUT_CSV = OUT_DIR / "macro_panel_gdp_population_demand_2006_2025.csv"
+
+TABLE_NAME = "macro_panel_gdp_population_demand_annual"
+
+
+def main():
+    if not MACRO_DB.exists():
+        raise FileNotFoundError(f"No encuentro la base macro: {MACRO_DB}")
+
+    with sqlite3.connect(MACRO_DB) as conn:
+        demand = pd.read_sql_query(
+            """
+            SELECT
+                year,
+                n_hours,
+                electricity_demand_twh_raw,
+                electricity_demand_twh_excluding_low_values,
+                n_low_demand_values,
+                min_demand_mw,
+                max_demand_mw,
+                mean_demand_mw
+            FROM macro_electricity_demand_peninsula_annual
+            ORDER BY year
+            """,
+            conn,
+        )
+
+        gdp = pd.read_sql_query(
+            """
+            SELECT
+                year,
+                gdp_current_million_eur,
+                gdp_volume_index_2020_100,
+                gdp_volume_growth_pct,
+                status_ine AS gdp_status_ine,
+                is_provisional AS gdp_is_provisional
+            FROM macro_gdp_spain_annual
+            ORDER BY year
+            """,
+            conn,
+        )
+
+        population = pd.read_sql_query(
+            """
+            SELECT
+                year,
+                population_jan1,
+                population_date,
+                status_ine AS population_status_ine,
+                is_provisional AS population_is_provisional
+            FROM macro_population_spain_annual
+            ORDER BY year
+            """,
+            conn,
+        )
+
+    # =========================
+    # UNIR TABLAS
+    # =========================
+
+    df = (
+        demand
+        .merge(gdp, on="year", how="inner")
+        .merge(population, on="year", how="inner")
+    )
+
+    expected_years = list(range(2006, 2026))
+    found_years = df["year"].tolist()
+
+    if found_years != expected_years:
+        raise ValueError(
+            "El panel no tiene exactamente los años esperados.\n"
+            f"Esperado: {expected_years}\n"
+            f"Encontrado: {found_years}"
+        )
+
+    # =========================
+    # PIB REAL APROXIMADO
+    # =========================
+    # El índice de volumen tiene base 2020=100.
+    # Para convertirlo a una magnitud aproximada en millones de euros de 2020,
+    # usamos como ancla el PIB corriente de 2020.
+    # Esto permite calcular indicadores reales de intensidad de forma más interpretable.
+
+    gdp_2020_current = df.loc[
+        df["year"] == 2020,
+        "gdp_current_million_eur"
+    ].iloc[0]
+
+    df["gdp_volume_million_eur_2020_ref"] = (
+        gdp_2020_current * df["gdp_volume_index_2020_100"] / 100
+    )
+
+    # =========================
+    # INDICADORES PRINCIPALES
+    # =========================
+
+    # Por ahora usamos la demanda raw como variable macro principal.
+    df["electricity_demand_twh_for_macro"] = df["electricity_demand_twh_raw"]
+
+    # PIB per cápita
+    df["gdp_current_eur_per_capita"] = (
+        df["gdp_current_million_eur"] * 1_000_000 / df["population_jan1"]
+    )
+
+    df["gdp_volume_2020_eur_per_capita"] = (
+        df["gdp_volume_million_eur_2020_ref"] * 1_000_000 / df["population_jan1"]
+    )
+
+    # Demanda eléctrica per cápita
+    # 1 TWh = 1.000.000 MWh
+    df["electricity_mwh_per_capita"] = (
+        df["electricity_demand_twh_for_macro"] * 1_000_000 / df["population_jan1"]
+    )
+
+    # Intensidad eléctrica respecto al PIB
+    # MWh por millón de euros
+    df["electricity_mwh_per_million_eur_current"] = (
+        df["electricity_demand_twh_for_macro"] * 1_000_000
+        / df["gdp_current_million_eur"]
+    )
+
+    df["electricity_mwh_per_million_eur_volume_2020"] = (
+        df["electricity_demand_twh_for_macro"] * 1_000_000
+        / df["gdp_volume_million_eur_2020_ref"]
+    )
+
+    # Flags metodológicos
+    df["macro_is_provisional"] = (
+        (df["gdp_is_provisional"] == 1)
+        | (df["population_is_provisional"] == 1)
+    ).astype(int)
+
+    df["macro_notes"] = ""
+
+    df.loc[df["year"] == 2025, "macro_notes"] = (
+        "2025 marcado como provisional en el bloque macro por PIB estimado CNTR."
+    )
+
+    df.loc[df["n_low_demand_values"] > 0, "macro_notes"] = (
+        df.loc[df["n_low_demand_values"] > 0, "macro_notes"].astype(str)
+        + " Año con valores horarios de demanda <=15000 MW pendientes de decisión metodológica."
+    )
+
+    # =========================
+    # REORDENAR COLUMNAS
+    # =========================
+
+    ordered_cols = [
+        "year",
+        "electricity_demand_twh_for_macro",
+        "electricity_demand_twh_raw",
+        "electricity_demand_twh_excluding_low_values",
+        "n_hours",
+        "n_low_demand_values",
+        "min_demand_mw",
+        "max_demand_mw",
+        "mean_demand_mw",
+        "gdp_current_million_eur",
+        "gdp_volume_index_2020_100",
+        "gdp_volume_million_eur_2020_ref",
+        "gdp_volume_growth_pct",
+        "population_jan1",
+        "population_date",
+        "gdp_current_eur_per_capita",
+        "gdp_volume_2020_eur_per_capita",
+        "electricity_mwh_per_capita",
+        "electricity_mwh_per_million_eur_current",
+        "electricity_mwh_per_million_eur_volume_2020",
+        "gdp_status_ine",
+        "gdp_is_provisional",
+        "population_status_ine",
+        "population_is_provisional",
+        "macro_is_provisional",
+        "macro_notes",
+    ]
+
+    df = df[ordered_cols]
+
+    # =========================
+    # GUARDAR CSV Y TABLA
+    # =========================
+
+    df.to_csv(OUT_CSV, index=False, encoding="utf-8")
+
+    with sqlite3.connect(MACRO_DB) as conn:
+        cur = conn.cursor()
+
+        cur.execute(f"DROP TABLE IF EXISTS {TABLE_NAME}")
+
+        df.to_sql(TABLE_NAME, conn, if_exists="replace", index=False)
+
+        conn.commit()
+
+    print("Panel macro creado correctamente:")
+    print(f"- Base: {MACRO_DB}")
+    print(f"- Tabla: {TABLE_NAME}")
+    print(f"- CSV: {OUT_CSV}")
+
+    print("\nResumen del panel:")
+    print(
+        df[
+            [
+                "year",
+                "electricity_demand_twh_for_macro",
+                "gdp_current_million_eur",
+                "gdp_volume_index_2020_100",
+                "population_jan1",
+                "gdp_current_eur_per_capita",
+                "electricity_mwh_per_capita",
+                "electricity_mwh_per_million_eur_volume_2020",
+                "macro_is_provisional",
+            ]
+        ].to_string(index=False)
+    )
+
+    print("\nComprobaciones clave:")
+    print(f"- Filas: {len(df)}")
+    print(f"- Año mínimo: {df['year'].min()}")
+    print(f"- Año máximo: {df['year'].max()}")
+    print(
+        "- Demanda 2006 TWh: "
+        f"{df.loc[df['year'] == 2006, 'electricity_demand_twh_for_macro'].iloc[0]:.3f}"
+    )
+    print(
+        "- Demanda 2025 TWh: "
+        f"{df.loc[df['year'] == 2025, 'electricity_demand_twh_for_macro'].iloc[0]:.3f}"
+    )
+    print(
+        "- Intensidad eléctrica real 2006 "
+        "(MWh/M€ 2020): "
+        f"{df.loc[df['year'] == 2006, 'electricity_mwh_per_million_eur_volume_2020'].iloc[0]:.3f}"
+    )
+    print(
+        "- Intensidad eléctrica real 2025* "
+        "(MWh/M€ 2020): "
+        f"{df.loc[df['year'] == 2025, 'electricity_mwh_per_million_eur_volume_2020'].iloc[0]:.3f}"
+    )
+    print(
+        "- 2025 provisional: "
+        f"{df.loc[df['year'] == 2025, 'macro_is_provisional'].iloc[0]}"
+    )
+
+
+if __name__ == "__main__":
+    main()

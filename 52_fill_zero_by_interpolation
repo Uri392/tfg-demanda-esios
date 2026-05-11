@@ -1,0 +1,49 @@
+import pandas as pd
+import numpy as np
+
+IN_PATH  = r"exports\demand_peninsula_hourly_2006_2025.csv"
+OUT_PATH = r"exports\demand_peninsula_hourly_2006_2025_clean.csv"
+
+df = pd.read_csv(IN_PATH)
+
+# parse time
+df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"])
+
+# ordenar por si acaso
+df = df.sort_values("timestamp_utc").reset_index(drop=True)
+
+# localizar ceros
+zero_mask = df["demand_mw"] == 0
+n_zeros = int(zero_mask.sum())
+print("Ceros encontrados:", n_zeros)
+
+if n_zeros == 0:
+    print("No hay ceros. No hago nada.")
+    df.to_csv(OUT_PATH, index=False)
+    raise SystemExit
+
+# guardar valores originales para report
+zeros_rows = df.loc[zero_mask, ["timestamp_utc", "demand_mw"]].copy()
+print("\nFilas con 0 antes:")
+print(zeros_rows.to_string(index=False))
+
+# 1) marcar como NaN
+df.loc[zero_mask, "demand_mw"] = np.nan
+
+# 2) interpolar por tiempo (lineal)
+# usamos timestamp como índice temporal
+df = df.set_index("timestamp_utc")
+df["demand_mw"] = df["demand_mw"].interpolate(method="time", limit=3)
+
+df = df.reset_index()
+
+# comprobar después
+filled_rows = df[df["timestamp_utc"].isin(zeros_rows["timestamp_utc"])][["timestamp_utc", "demand_mw"]]
+print("\nFilas tras interpolación:")
+print(filled_rows.to_string(index=False))
+
+# guardar
+df["timestamp_utc"] = df["timestamp_utc"].dt.strftime("%Y-%m-%d %H:%M:%S")
+df.to_csv(OUT_PATH, index=False)
+
+print("\n✅ Guardado:", OUT_PATH)

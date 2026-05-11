@@ -1,0 +1,68 @@
+import sqlite3
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+
+DB_PATH = r"data\db\master_energy.sqlite"
+
+season_case = """
+CASE
+  WHEN CAST(substr(d.timestamp_utc, 6, 2) AS INTEGER) IN (12, 1, 2) THEN 'Invierno'
+  WHEN CAST(substr(d.timestamp_utc, 6, 2) AS INTEGER) IN (3, 4, 5) THEN 'Primavera'
+  WHEN CAST(substr(d.timestamp_utc, 6, 2) AS INTEGER) IN (6, 7, 8) THEN 'Verano'
+  WHEN CAST(substr(d.timestamp_utc, 6, 2) AS INTEGER) IN (9,10,11) THEN 'Otoño'
+END
+"""
+
+con = sqlite3.connect(DB_PATH)
+
+df = pd.read_sql(f"""
+SELECT
+  d.demand_mw,
+  t.temp_c,
+  {season_case} AS season
+FROM demand_peninsula_hourly d
+JOIN temperature_peninsula_hourly t
+  ON d.timestamp_utc = t.timestamp_utc;
+""", con)
+
+con.close()
+
+df = df.dropna(subset=["demand_mw", "temp_c"])
+df["demand_mw"] = pd.to_numeric(df["demand_mw"], errors="coerce")
+df["temp_c"] = pd.to_numeric(df["temp_c"], errors="coerce")
+df = df.dropna(subset=["demand_mw", "temp_c"])
+
+# bins de 1°C
+tmin = np.floor(df["temp_c"].min())
+tmax = np.ceil(df["temp_c"].max())
+bins = np.arange(tmin, tmax + 1, 1)
+
+df["temp_bin"] = pd.cut(df["temp_c"], bins=bins, include_lowest=True)
+
+# Global
+g = df.groupby("temp_bin")["demand_mw"].agg(["mean", "count"]).reset_index()
+g["temp_mid"] = g["temp_bin"].apply(lambda x: (x.left + x.right)/2)
+
+plt.figure(figsize=(9,5))
+plt.plot(g["temp_mid"], g["mean"])
+plt.title("Demanda media por rangos de temperatura (global)")
+plt.xlabel("Temperatura (°C) (centro del bin)")
+plt.ylabel("Demanda media (MW)")
+plt.tight_layout()
+plt.show()
+
+# Por estación
+plt.figure(figsize=(9,5))
+for s in ["Invierno", "Primavera", "Verano", "Otoño"]:
+    d = df[df["season"] == s].copy()
+    gg = d.groupby("temp_bin")["demand_mw"].mean().reset_index(name="mean")
+    gg["temp_mid"] = gg["temp_bin"].apply(lambda x: (x.left + x.right)/2)
+    plt.plot(gg["temp_mid"], gg["mean"], label=s)
+
+plt.title("Demanda media por rangos de temperatura (por estación)")
+plt.xlabel("Temperatura (°C) (centro del bin)")
+plt.ylabel("Demanda media (MW)")
+plt.legend()
+plt.tight_layout()
+plt.show()

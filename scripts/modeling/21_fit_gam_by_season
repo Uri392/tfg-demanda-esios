@@ -1,0 +1,698 @@
+from pathlib import Path
+import sqlite3
+import sys
+import warnings
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+warnings.filterwarnings("ignore")
+
+# ============================================================
+# COMPROBAR PYGAM
+# ============================================================
+
+try:
+    from pygam import LinearGAM, s, f, te
+except ImportError:
+    print("ERROR: No tienes instalado pygam.")
+    print("Instálalo con:")
+    print(r".\.venv\Scripts\python.exe -m pip install pygam")
+    sys.exit(1)
+
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+DB_PATH = Path("data/db/master_energy.sqlite")
+
+OUT_DIR = Path("outputs/modeling/gam_by_season")
+PLOT_DIR = OUT_DIR / "plots"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+PLOT_DIR.mkdir(parents=True, exist_ok=True)
+
+TRAIN_END_YEAR = 2020
+TEST_START_YEAR = 2021
+LOW_DEMAND_THRESHOLD = 15000
+
+TIMEZONE_LOCAL = "Europe/Madrid"
+
+
+# ============================================================
+# FUNCIONES AUXILIARES
+# ============================================================
+
+def rmse(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return np.sqrt(np.mean((y_true - y_pred) ** 2))
+
+
+def mae(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return np.mean(np.abs(y_true - y_pred))
+
+
+def r2_score_manual(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    return 1 - ss_res / ss_tot
+
+
+def evaluate_model(model_name, y_train, pred_train, y_test, pred_test):
+    return {
+        "model": model_name,
+        "r2_train": r2_score_manual(y_train, pred_train),
+        "r2_test": r2_score_manual(y_test, pred_test),
+        "rmse_train_mw": rmse(y_train, pred_train),
+        "rmse_test_mw": rmse(y_test, pred_test),
+        "mae_train_mw": mae(y_train, pred_train),
+        "mae_test_mw": mae(y_test, pred_test),
+    }
+
+
+def find_hourly_table(conn):
+    """
+    Busca automáticamente una tabla horaria que contenga las columnas necesarias.
+    Si no la encuentra, imprime las tablas y columnas disponibles para diagnosticar.
+    """
+
+    tables = pd.read_sql(
+        "SELECT name FROM sqlite_master WHERE type='table';",
+        conn
+    )["name"].tolist()
+
+    print("\nTablas encontradas en la base de datos:")
+    for table in tables:
+        print(f"- {table}")
+
+    required_sets = [
+        {"timestamp_utc", "demand_mw", "temp_c"},
+        {"timestamp_utc", "load_mw", "temp_c"},
+        {"timestamp_utc", "demand_mw", "temperature_c"},
+        {"timestamp_utc", "load_mw", "temperature_c"},
+    ]
+
+    for table in tables:
+        cols = pd.read_sql(f"PRAGMA table_info({table});", conn)["name"].tolist()
+        cols_lower = {c.lower() for c in cols}
+
+        for required_cols in required_sets:
+            if required_cols.issubset(cols_lower):
+                print(f"\nTabla horaria detectada automáticamente: {table}")
+                print(f"Columnas disponibles: {cols}")
+                return table
+
+    print("\nNo se ha encontrado automáticamente una tabla horaria válida.")
+    print("\nColumnas por tabla:")
+
+    for table in tables:
+        cols = pd.read_sql(f"PRAGMA table_info({table});", conn)["name"].tolist()
+        print(f"\n{table}:")
+        for col in cols:
+            print(f"  - {col}")
+
+    raise ValueError(
+        "No se ha encontrado ninguna tabla con columnas equivalentes a "
+        "timestamp_utc, demand_mw/load_mw y temp_c/temperature_c."
+    )
+
+def load_data():
+    """
+    Carga demanda y temperatura desde dos tablas separadas y las une por timestamp_utc.
+
+    Tablas esperadas:
+    - demand_peninsula_hourly: timestamp_utc, demand_mw
+    - temperature_peninsula_hourly: timestamp_utc, temp_c
+    """
+
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"No existe la base de datos: {DB_PATH}")
+
+    conn = sqlite3.connect(DB_PATH)
+
+    # Comprobamos tablas disponibles
+    tables = pd.read_sql(
+        "SELECT name FROM sqlite_master WHERE type='table';",
+        conn
+    )["name"].tolist()
+
+    print("\nTablas encontradas en la base de datos:")
+    for table in tables:
+        print(f"- {table}")
+
+    required_tables = {
+        "demand_peninsula_hourly",
+        "temperature_peninsula_hourly",
+    }
+
+    missing_tables = required_tables - set(tables)
+
+    if missing_tables:
+        conn.close()
+        raise ValueError(
+            f"Faltan tablas necesarias en la base de datos: {missing_tables}"
+        )
+
+    # Leemos demanda
+    demand = pd.read_sql(
+        """
+        SELECT 
+            timestamp_utc,
+            demand_mw
+        FROM demand_peninsula_hourly
+        ORDER BY timestamp_utc
+        """,
+        conn
+    )
+
+    # Leemos temperatura
+    temp = pd.read_sql(
+        """
+        SELECT 
+            timestamp_utc,
+            temp_c
+        FROM temperature_peninsula_hourly
+        ORDER BY timestamp_utc
+        """,
+        conn
+    )
+
+    conn.close()
+
+    # Conversión de tipos
+    demand["timestamp_utc"] = pd.to_datetime(demand["timestamp_utc"], utc=True)
+    temp["timestamp_utc"] = pd.to_datetime(temp["timestamp_utc"], utc=True)
+
+    demand["demand_mw"] = pd.to_numeric(demand["demand_mw"], errors="coerce")
+    temp["temp_c"] = pd.to_numeric(temp["temp_c"], errors="coerce")
+
+    # Eliminamos posibles nulos antes de unir
+    demand = demand.dropna(subset=["timestamp_utc", "demand_mw"]).copy()
+    temp = temp.dropna(subset=["timestamp_utc", "temp_c"]).copy()
+
+    print("\nFilas leídas:")
+    print(f"- Demanda:     {len(demand):,}")
+    print(f"- Temperatura: {len(temp):,}")
+
+    # Unión por timestamp UTC
+    df = pd.merge(
+        demand,
+        temp,
+        on="timestamp_utc",
+        how="inner"
+    )
+
+    df = df.sort_values("timestamp_utc").copy()
+
+    print("\nTras unir demanda y temperatura:")
+    print(f"- Filas unidas: {len(df):,}")
+    print(f"- Fecha mínima: {df['timestamp_utc'].min()}")
+    print(f"- Fecha máxima: {df['timestamp_utc'].max()}")
+
+    if len(df) == 0:
+        raise ValueError(
+            "La unión entre demanda y temperatura ha dado 0 filas. "
+            "Esto significa que los timestamp_utc no coinciden exactamente entre ambas tablas."
+        )
+
+    return df
+
+
+def build_manual_spanish_holidays(years):
+    """
+    Festivos nacionales fijos.
+    Se usa además de la librería holidays, porque en pruebas anteriores
+    vimos que algunos años no detectaban correctamente el 15 de agosto.
+    """
+    manual = {}
+
+    for year in years:
+        fixed_days = {
+            f"{year}-01-01": "Año Nuevo",
+            f"{year}-01-06": "Reyes",
+            f"{year}-05-01": "Fiesta del Trabajo",
+            f"{year}-08-15": "Asunción de la Virgen",
+            f"{year}-10-12": "Fiesta Nacional de España",
+            f"{year}-11-01": "Todos los Santos",
+            f"{year}-12-06": "Día de la Constitución",
+            f"{year}-12-08": "Inmaculada Concepción",
+            f"{year}-12-25": "Navidad",
+        }
+
+        for date_str, name in fixed_days.items():
+            manual[pd.Timestamp(date_str).date()] = name
+
+    return manual
+
+
+def add_calendar_features(df):
+    df = df.copy()
+
+    df["timestamp_madrid"] = df["timestamp_utc"].dt.tz_convert(TIMEZONE_LOCAL)
+    df["local_date"] = df["timestamp_madrid"].dt.date
+    df["local_year"] = df["timestamp_madrid"].dt.year
+    df["local_month"] = df["timestamp_madrid"].dt.month
+    df["local_day_of_week"] = df["timestamp_madrid"].dt.dayofweek
+    df["local_hour"] = df["timestamp_madrid"].dt.hour
+
+    # Tendencia temporal en años desde el inicio
+    min_ts = df["timestamp_utc"].min()
+    df["trend_years"] = (
+        (df["timestamp_utc"] - min_ts).dt.total_seconds()
+        / (365.25 * 24 * 3600)
+    )
+
+    # Estaciones meteorológicas usando mes local
+    season_map = {
+        12: "DJF", 1: "DJF", 2: "DJF",
+        3: "MAM", 4: "MAM", 5: "MAM",
+        6: "JJA", 7: "JJA", 8: "JJA",
+        9: "SON", 10: "SON", 11: "SON",
+    }
+
+    df["season"] = df["local_month"].map(season_map)
+
+    # Festivos nacionales
+    years = range(df["local_year"].min(), df["local_year"].max() + 1)
+    manual_holidays = build_manual_spanish_holidays(years)
+
+    try:
+        import holidays
+        es_holidays = holidays.Spain(years=years)
+    except ImportError:
+        es_holidays = {}
+
+    def is_spanish_holiday(date_value):
+        return int((date_value in es_holidays) or (date_value in manual_holidays))
+
+    df["is_holiday_es"] = df["local_date"].apply(is_spanish_holiday)
+
+    # Variables de inercia térmica.
+    # Importante: se calculan antes de filtrar por estación.
+    df = df.sort_values("timestamp_utc").copy()
+    df["temp_lag24"] = df["temp_c"].shift(24)
+    df["temp_mean_24h_prev"] = df["temp_c"].shift(1).rolling(24).mean()
+
+    return df
+
+
+def build_baseline_matrix(train, test):
+    """
+    Modelo base:
+    demanda = temp + temp² + hora + día semana + mes + festivo + tendencia
+    """
+    train_x = train.copy()
+    test_x = test.copy()
+
+    train_x["temp_c2"] = train_x["temp_c"] ** 2
+    test_x["temp_c2"] = test_x["temp_c"] ** 2
+
+    feature_cols_numeric = [
+        "temp_c",
+        "temp_c2",
+        "trend_years",
+        "is_holiday_es",
+    ]
+
+    feature_cols_categorical = [
+        "local_hour",
+        "local_day_of_week",
+        "local_month",
+    ]
+
+    combined = pd.concat(
+        [
+            train_x[feature_cols_numeric + feature_cols_categorical].assign(split="train"),
+            test_x[feature_cols_numeric + feature_cols_categorical].assign(split="test"),
+        ],
+        axis=0
+    )
+
+    combined_dummies = pd.get_dummies(
+        combined,
+        columns=feature_cols_categorical,
+        drop_first=False
+    )
+
+    train_matrix = combined_dummies[combined_dummies["split"] == "train"].drop(columns="split")
+    test_matrix = combined_dummies[combined_dummies["split"] == "test"].drop(columns="split")
+
+    # Añadimos intercepto
+    train_matrix.insert(0, "intercept", 1.0)
+    test_matrix.insert(0, "intercept", 1.0)
+
+    return train_matrix.astype(float).values, test_matrix.astype(float).values
+
+
+def fit_baseline_linear(train, test):
+    x_train, x_test = build_baseline_matrix(train, test)
+
+    y_train = train["demand_mw"].values
+    y_test = test["demand_mw"].values
+
+    coef, *_ = np.linalg.lstsq(x_train, y_train, rcond=None)
+
+    pred_train = x_train @ coef
+    pred_test = x_test @ coef
+
+    return pred_train, pred_test
+
+
+def build_gam_matrix(df):
+    """
+    Columnas del modelo GAM:
+
+    0 temp_c
+    1 local_hour
+    2 local_day_of_week
+    3 local_month
+    4 trend_years
+    5 is_holiday_es
+    6 temp_lag24
+    7 temp_mean_24h_prev
+    """
+    cols = [
+        "temp_c",
+        "local_hour",
+        "local_day_of_week",
+        "local_month",
+        "trend_years",
+        "is_holiday_es",
+        "temp_lag24",
+        "temp_mean_24h_prev",
+    ]
+
+    return df[cols].astype(float).values
+
+
+def fit_gam_best_structure(train, test):
+    x_train = build_gam_matrix(train)
+    x_test = build_gam_matrix(test)
+
+    y_train = train["demand_mw"].values
+    y_test = test["demand_mw"].values
+
+    terms = (
+        s(0, n_splines=12) +                    # temperatura actual
+        te(0, 1, n_splines=[12, 8]) +            # interacción temperatura-hora
+        f(1) +                                   # hora local
+        f(2) +                                   # día de semana
+        f(3) +                                   # mes
+        s(4, n_splines=10) +                     # tendencia temporal
+        f(5) +                                   # festivo nacional
+        s(6, n_splines=10) +                     # temperatura misma hora día anterior
+        s(7, n_splines=10)                       # temperatura media 24 h previas
+    )
+
+    gam = LinearGAM(terms)
+    gam.fit(x_train, y_train)
+
+    pred_train = gam.predict(x_train)
+    pred_test = gam.predict(x_test)
+
+    return gam, pred_train, pred_test
+
+
+def analyze_one_season(df, season):
+    print("\n" + "=" * 90)
+    print(f"ESTACIÓN: {season}")
+    print("=" * 90)
+
+    season_df = df[df["season"] == season].copy()
+
+    before_low = len(season_df)
+    low_values = season_df[season_df["demand_mw"] <= LOW_DEMAND_THRESHOLD]
+
+    season_df = season_df[season_df["demand_mw"] > LOW_DEMAND_THRESHOLD].copy()
+    season_df = season_df.dropna(subset=["temp_lag24", "temp_mean_24h_prev"]).copy()
+
+    print(f"Filas antes de filtrar demanda baja: {before_low:,}")
+    print(f"Valores con demanda <= {LOW_DEMAND_THRESHOLD} MW: {len(low_values):,}")
+    print(f"Filas tras filtrar y eliminar NaN de inercia: {len(season_df):,}")
+
+    train = season_df[season_df["local_year"] <= TRAIN_END_YEAR].copy()
+    test = season_df[season_df["local_year"] >= TEST_START_YEAR].copy()
+
+    print(f"Train: <= {TRAIN_END_YEAR} | filas: {len(train):,}")
+    print(f"Test:  >= {TEST_START_YEAR} | filas: {len(test):,}")
+
+    if len(train) == 0 or len(test) == 0:
+        print("No hay suficientes datos para esta estación.")
+        return None, None
+
+    y_train = train["demand_mw"].values
+    y_test = test["demand_mw"].values
+
+    # --------------------------------------------------------
+    # Modelo base
+    # --------------------------------------------------------
+
+    print("Ajustando modelo base polinómico + calendario...")
+    pred_train_base, pred_test_base = fit_baseline_linear(train, test)
+
+    metrics_base = evaluate_model(
+        "baseline_poly2_calendar_holiday",
+        y_train,
+        pred_train_base,
+        y_test,
+        pred_test_base,
+    )
+
+    # --------------------------------------------------------
+    # GAM con estructura ganadora de verano
+    # --------------------------------------------------------
+
+    print("Ajustando GAM con interacción temperatura-hora + inercia térmica...")
+    gam, pred_train_gam, pred_test_gam = fit_gam_best_structure(train, test)
+
+    metrics_gam = evaluate_model(
+        "gam_temp_hour_interaction_inertia",
+        y_train,
+        pred_train_gam,
+        y_test,
+        pred_test_gam,
+    )
+
+    metrics = pd.DataFrame([metrics_base, metrics_gam])
+    metrics.insert(0, "season", season)
+
+    # Diferencias del GAM respecto al modelo base
+    base_row = metrics[metrics["model"] == "baseline_poly2_calendar_holiday"].iloc[0]
+    gam_row = metrics[metrics["model"] == "gam_temp_hour_interaction_inertia"].iloc[0]
+
+    delta = {
+        "season": season,
+        "delta_r2_test_gam_vs_base": gam_row["r2_test"] - base_row["r2_test"],
+        "delta_rmse_test_mw_gam_vs_base": gam_row["rmse_test_mw"] - base_row["rmse_test_mw"],
+        "delta_mae_test_mw_gam_vs_base": gam_row["mae_test_mw"] - base_row["mae_test_mw"],
+    }
+
+    print("\nComparación de modelos:")
+    print(metrics.to_string(index=False))
+
+    print("\nMejora GAM vs base:")
+    print(
+        f"- Δ R² test:   {delta['delta_r2_test_gam_vs_base']:.4f}\n"
+        f"- Δ RMSE test: {delta['delta_rmse_test_mw_gam_vs_base']:.1f} MW\n"
+        f"- Δ MAE test:  {delta['delta_mae_test_mw_gam_vs_base']:.1f} MW"
+    )
+
+    # --------------------------------------------------------
+    # Predicciones test
+    # --------------------------------------------------------
+
+    pred_test_df = test[
+        [
+            "timestamp_utc",
+            "timestamp_madrid",
+            "local_year",
+            "local_month",
+            "local_hour",
+            "local_day_of_week",
+            "season",
+            "demand_mw",
+            "temp_c",
+            "temp_lag24",
+            "temp_mean_24h_prev",
+            "is_holiday_es",
+        ]
+    ].copy()
+
+    pred_test_df["pred_base_mw"] = pred_test_base
+    pred_test_df["pred_gam_mw"] = pred_test_gam
+    pred_test_df["error_base_mw"] = pred_test_df["demand_mw"] - pred_test_df["pred_base_mw"]
+    pred_test_df["error_gam_mw"] = pred_test_df["demand_mw"] - pred_test_df["pred_gam_mw"]
+    pred_test_df["abs_error_base_mw"] = pred_test_df["error_base_mw"].abs()
+    pred_test_df["abs_error_gam_mw"] = pred_test_df["error_gam_mw"].abs()
+
+    return metrics, pd.DataFrame([delta]), pred_test_df
+
+
+def plot_rmse_by_season(comparison):
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    pivot = comparison.pivot(
+        index="season",
+        columns="model",
+        values="rmse_test_mw"
+    )
+
+    season_order = ["DJF", "MAM", "JJA", "SON"]
+    pivot = pivot.loc[[s for s in season_order if s in pivot.index]]
+
+    pivot.plot(kind="bar", ax=ax)
+
+    ax.set_title("RMSE de test por estación")
+    ax.set_xlabel("Estación")
+    ax.set_ylabel("RMSE test (MW)")
+    ax.grid(True, alpha=0.25)
+    plt.xticks(rotation=0)
+    plt.tight_layout()
+
+    out_path = PLOT_DIR / "01_rmse_test_by_season.png"
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+    print(f"Gráfico guardado: {out_path}")
+
+
+def plot_r2_by_season(comparison):
+    fig, ax = plt.subplots(figsize=(10, 5))
+
+    pivot = comparison.pivot(
+        index="season",
+        columns="model",
+        values="r2_test"
+    )
+
+    season_order = ["DJF", "MAM", "JJA", "SON"]
+    pivot = pivot.loc[[s for s in season_order if s in pivot.index]]
+
+    pivot.plot(kind="bar", ax=ax)
+
+    ax.set_title("R² de test por estación")
+    ax.set_xlabel("Estación")
+    ax.set_ylabel("R² test")
+    ax.grid(True, alpha=0.25)
+    plt.xticks(rotation=0)
+    plt.tight_layout()
+
+    out_path = PLOT_DIR / "02_r2_test_by_season.png"
+    plt.savefig(out_path, dpi=150)
+    plt.close()
+
+    print(f"Gráfico guardado: {out_path}")
+
+
+def plot_monthly_observed_vs_predicted(predictions):
+    monthly = (
+        predictions
+        .groupby(["season", "local_year", "local_month"], as_index=False)
+        .agg(
+            observed_mean_mw=("demand_mw", "mean"),
+            predicted_gam_mean_mw=("pred_gam_mw", "mean"),
+        )
+    )
+
+    monthly["year_month"] = (
+        monthly["local_year"].astype(str)
+        + "-"
+        + monthly["local_month"].astype(str).str.zfill(2)
+    )
+
+    for season in ["DJF", "MAM", "JJA", "SON"]:
+        season_monthly = monthly[monthly["season"] == season].copy()
+
+        if season_monthly.empty:
+            continue
+
+        fig, ax = plt.subplots(figsize=(11, 5))
+
+        ax.plot(
+            season_monthly["year_month"],
+            season_monthly["observed_mean_mw"],
+            marker="o",
+            label="Observado"
+        )
+
+        ax.plot(
+            season_monthly["year_month"],
+            season_monthly["predicted_gam_mean_mw"],
+            marker="o",
+            label="Predicho GAM"
+        )
+
+        ax.set_title(f"{season} test 2021-2025: demanda observada vs predicha")
+        ax.set_xlabel("Mes")
+        ax.set_ylabel("Demanda media (MW)")
+        ax.grid(True, alpha=0.25)
+        ax.legend()
+        plt.xticks(rotation=45, ha="right")
+        plt.tight_layout()
+
+        out_path = PLOT_DIR / f"03_monthly_observed_vs_predicted_{season}.png"
+        plt.savefig(out_path, dpi=150)
+        plt.close()
+
+        print(f"Gráfico guardado: {out_path}")
+
+
+def main():
+    df = load_data()
+    print(f"Filas leídas totales: {len(df):,}")
+
+    df = add_calendar_features(df)
+
+    all_metrics = []
+    all_deltas = []
+    all_predictions = []
+
+    for season in ["DJF", "MAM", "JJA", "SON"]:
+        metrics, delta, predictions = analyze_one_season(df, season)
+
+        if metrics is not None:
+            all_metrics.append(metrics)
+            all_deltas.append(delta)
+            all_predictions.append(predictions)
+
+    comparison = pd.concat(all_metrics, ignore_index=True)
+    deltas = pd.concat(all_deltas, ignore_index=True)
+    predictions = pd.concat(all_predictions, ignore_index=True)
+
+    comparison_path = OUT_DIR / "season_model_comparison.csv"
+    deltas_path = OUT_DIR / "season_gam_vs_baseline_deltas.csv"
+    predictions_path = OUT_DIR / "season_test_predictions.csv"
+
+    comparison.to_csv(comparison_path, index=False)
+    deltas.to_csv(deltas_path, index=False)
+    predictions.to_csv(predictions_path, index=False)
+
+    print("\n" + "=" * 90)
+    print("RESUMEN GLOBAL POR ESTACIÓN")
+    print("=" * 90)
+    print(comparison.to_string(index=False))
+
+    print("\n" + "=" * 90)
+    print("MEJORA DEL GAM RESPECTO AL MODELO BASE")
+    print("=" * 90)
+    print(deltas.to_string(index=False))
+
+    plot_rmse_by_season(comparison)
+    plot_r2_by_season(comparison)
+    plot_monthly_observed_vs_predicted(predictions)
+
+    print("\nArchivos generados:")
+    print(f"- Comparación modelos: {comparison_path}")
+    print(f"- Mejoras GAM vs base: {deltas_path}")
+    print(f"- Predicciones test: {predictions_path}")
+    print(f"- Gráficos: {PLOT_DIR}")
+
+
+if __name__ == "__main__":
+    main()

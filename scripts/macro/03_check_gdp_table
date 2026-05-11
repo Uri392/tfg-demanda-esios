@@ -1,0 +1,53 @@
+from pathlib import Path
+import sqlite3
+
+import pandas as pd
+
+
+MACRO_DB = Path("data/db/master_energy_macro.sqlite")
+TABLE_NAME = "macro_gdp_spain_annual"
+
+
+def main():
+    if not MACRO_DB.exists():
+        raise FileNotFoundError(f"No encuentro la base macro: {MACRO_DB}")
+
+    with sqlite3.connect(MACRO_DB) as conn:
+        # Listar tablas
+        tables = pd.read_sql_query(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+            ORDER BY name
+            """,
+            conn,
+        )
+
+        print("Tablas disponibles en la base macro:")
+        print(tables.to_string(index=False))
+
+        print("\nContenido de la tabla de PIB:")
+        df = pd.read_sql_query(
+            f"""
+            SELECT *
+            FROM {TABLE_NAME}
+            ORDER BY year
+            """,
+            conn,
+        )
+
+    print(df.to_string(index=False))
+
+    print("\nComprobaciones:")
+    print(f"- Filas: {len(df)}")
+    print(f"- Año mínimo: {df['year'].min()}")
+    print(f"- Año máximo: {df['year'].max()}")
+    print(f"- PIB corriente 2024: {df.loc[df['year'] == 2024, 'gdp_current_million_eur'].iloc[0]:,.0f} M€")
+    print(f"- PIB corriente 2025*: {df.loc[df['year'] == 2025, 'gdp_current_million_eur'].iloc[0]:,.0f} M€")
+    print(f"- Estado 2025: {df.loc[df['year'] == 2025, 'status_ine'].iloc[0]}")
+    print(f"- 2025 provisional: {df.loc[df['year'] == 2025, 'is_provisional'].iloc[0]}")
+
+
+if __name__ == "__main__":
+    main()

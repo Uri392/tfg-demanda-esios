@@ -1,0 +1,250 @@
+from pathlib import Path
+import sqlite3
+
+import pandas as pd
+
+
+# =========================
+# CONFIGURACIÓN
+# =========================
+
+XLSX_PATH = Path("data/external/macro/miteco_webtabla_inv_ed2026.xlsx")
+MACRO_DB = Path("data/db/master_energy_macro.sqlite")
+
+OUT_DIR = Path("data/external/macro")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+OUT_CSV = OUT_DIR / "co2_spain_miteco_2006_2024.csv"
+
+SHEET_NAME = "Total GEI por gas y sector"
+TABLE_NAME = "macro_co2_spain_annual"
+
+START_YEAR = 2006
+END_YEAR = 2024
+
+
+def clean_text(value):
+    if pd.isna(value):
+        return ""
+    return str(value).strip().upper()
+
+
+def main():
+    if not XLSX_PATH.exists():
+        raise FileNotFoundError(f"No encuentro el Excel de MITECO: {XLSX_PATH}")
+
+    if not MACRO_DB.exists():
+        raise FileNotFoundError(f"No encuentro la base macro: {MACRO_DB}")
+
+    print("Leyendo Excel de MITECO...")
+    print(f"- Archivo: {XLSX_PATH}")
+    print(f"- Hoja: {SHEET_NAME}")
+
+    df = pd.read_excel(
+        XLSX_PATH,
+        sheet_name=SHEET_NAME,
+        dtype=object,
+    )
+
+    print(f"Filas leídas: {len(df):,}")
+    print(f"Columnas leídas: {len(df.columns):,}")
+
+    required_cols = {"SECCION", "CONTAMINANTE", "UNIDAD"}
+
+    missing = required_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Faltan columnas esperadas: {missing}")
+
+    years = list(range(START_YEAR, END_YEAR + 1))
+    em_cols = [f"EM{year}" for year in years]
+
+    missing_em_cols = [col for col in em_cols if col not in df.columns]
+    if missing_em_cols:
+        raise ValueError(f"Faltan columnas de emisiones: {missing_em_cols}")
+
+    # Normalizar campos clave
+    df["SECCION_CLEAN"] = df["SECCION"].apply(clean_text)
+    df["CONTAMINANTE_CLEAN"] = df["CONTAMINANTE"].apply(clean_text)
+    df["UNIDAD_CLEAN"] = df["UNIDAD"].apply(clean_text)
+
+    # Convertir columnas de emisiones a numérico
+    for col in em_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    # =========================
+    # FILTRO PRINCIPAL: CO2 EXCLUYENDO LULUCF
+    # =========================
+
+    co2_inv = df[
+        (df["SECCION_CLEAN"] == "INV")
+        & (df["CONTAMINANTE_CLEAN"] == "CO2")
+        & (df["UNIDAD_CLEAN"] == "GG")
+    ].copy()
+
+    # =========================
+    # FILTRO SECUNDARIO: CO2 LULUCF
+    # =========================
+    # Esto no será la variable principal, pero lo guardamos para trazabilidad.
+
+    co2_lulucf = df[
+        (df["SECCION_CLEAN"] == "LULUCF")
+        & (df["CONTAMINANTE_CLEAN"] == "CO2")
+        & (df["UNIDAD_CLEAN"] == "GG")
+    ].copy()
+
+    if co2_inv.empty:
+        raise ValueError("El filtro principal CO2 / INV / Gg no ha encontrado filas.")
+
+    print("\nFilas CO2 excluyendo LULUCF encontradas:")
+    print(f"- {len(co2_inv)} filas")
+
+    print("\nFilas CO2 LULUCF encontradas:")
+    print(f"- {len(co2_lulucf)} filas")
+
+    # =========================
+    # AGREGACIÓN ANUAL
+    # =========================
+
+    rows = []
+
+    for year in years:
+        col = f"EM{year}"
+
+        co2_excl_lulucf_gg = co2_inv[col].sum(skipna=True)
+        co2_lulucf_gg = co2_lulucf[col].sum(skipna=True)
+
+        co2_incl_lulucf_gg = co2_excl_lulucf_gg + co2_lulucf_gg
+
+        rows.append(
+            {
+                "year": year,
+
+                # Variable principal
+                "co2_excl_lulucf_gg": co2_excl_lulucf_gg,
+                "co2_excl_lulucf_mt": co2_excl_lulucf_gg / 1000,
+
+                # Variable secundaria
+                "co2_lulucf_gg": co2_lulucf_gg,
+                "co2_lulucf_mt": co2_lulucf_gg / 1000,
+
+                # Total incluyendo LULUCF, no principal
+                "co2_incl_lulucf_gg": co2_incl_lulucf_gg,
+                "co2_incl_lulucf_mt": co2_incl_lulucf_gg / 1000,
+
+                "unit_original": "Gg CO2",
+                "unit_mt": "Mt CO2",
+
+                "source": "MITECO - Inventario Nacional de Gases de Efecto Invernadero, edición 2026",
+                "source_file": str(XLSX_PATH),
+                "source_sheet": SHEET_NAME,
+
+                "main_series_definition": "CO2 nacional excluyendo LULUCF: SECCION=INV, CONTAMINANTE=CO2, UNIDAD=Gg",
+                "notes": "La serie principal excluye LULUCF. 1 Mt = 1000 Gg.",
+                "is_provisional": 0,
+            }
+        )
+
+    df_out = pd.DataFrame(rows)
+
+    # =========================
+    # COMPROBACIONES
+    # =========================
+
+    if len(df_out) != (END_YEAR - START_YEAR + 1):
+        raise ValueError(
+            f"Se esperaban {END_YEAR - START_YEAR + 1} filas, "
+            f"pero se han obtenido {len(df_out)}."
+        )
+
+    if df_out["co2_excl_lulucf_mt"].isna().any():
+        raise ValueError("Hay valores NaN en co2_excl_lulucf_mt.")
+
+    if (df_out["co2_excl_lulucf_mt"] <= 0).any():
+        raise ValueError("Hay valores no positivos en co2_excl_lulucf_mt.")
+
+    # =========================
+    # GUARDAR CSV
+    # =========================
+
+    df_out.to_csv(OUT_CSV, index=False, encoding="utf-8")
+
+    # =========================
+    # IMPORTAR A SQLITE
+    # =========================
+
+    with sqlite3.connect(MACRO_DB) as conn:
+        cur = conn.cursor()
+
+        cur.execute(f"DROP TABLE IF EXISTS {TABLE_NAME}")
+
+        cur.execute(
+            f"""
+            CREATE TABLE {TABLE_NAME} (
+                year INTEGER PRIMARY KEY,
+                co2_excl_lulucf_gg REAL NOT NULL,
+                co2_excl_lulucf_mt REAL NOT NULL,
+                co2_lulucf_gg REAL,
+                co2_lulucf_mt REAL,
+                co2_incl_lulucf_gg REAL,
+                co2_incl_lulucf_mt REAL,
+                unit_original TEXT,
+                unit_mt TEXT,
+                source TEXT,
+                source_file TEXT,
+                source_sheet TEXT,
+                main_series_definition TEXT,
+                notes TEXT,
+                is_provisional INTEGER
+            )
+            """
+        )
+
+        df_out.to_sql(TABLE_NAME, conn, if_exists="append", index=False)
+
+        conn.commit()
+
+    print("\nCSV creado correctamente:")
+    print(f"- {OUT_CSV}")
+
+    print("\nTabla importada correctamente:")
+    print(f"- Base: {MACRO_DB}")
+    print(f"- Tabla: {TABLE_NAME}")
+
+    print("\nResumen CO2 2006-2024:")
+    print(
+        df_out[
+            [
+                "year",
+                "co2_excl_lulucf_mt",
+                "co2_lulucf_mt",
+                "co2_incl_lulucf_mt",
+            ]
+        ].to_string(index=False)
+    )
+
+    first = df_out[df_out["year"] == START_YEAR].iloc[0]
+    last = df_out[df_out["year"] == END_YEAR].iloc[0]
+
+    change_pct = (
+        last["co2_excl_lulucf_mt"] / first["co2_excl_lulucf_mt"] - 1
+    ) * 100
+
+    print("\nComprobaciones CO2:")
+    print(f"- Filas: {len(df_out)}")
+    print(f"- Año mínimo: {df_out['year'].min()}")
+    print(f"- Año máximo: {df_out['year'].max()}")
+    print(f"- CO2 2006 excl. LULUCF: {first['co2_excl_lulucf_mt']:.3f} Mt")
+    print(f"- CO2 2024 excl. LULUCF: {last['co2_excl_lulucf_mt']:.3f} Mt")
+    print(f"- Cambio CO2 2006-2024 excl. LULUCF: {change_pct:.2f}%")
+
+    print("\nNota metodológica:")
+    print(
+        "La serie principal usada para el TFG será CO2 excluyendo LULUCF. "
+        "La parte LULUCF se guarda solo como información secundaria, porque "
+        "incluye absorciones/emisiones del uso del suelo y puede distorsionar "
+        "la comparación macro con PIB, población y demanda eléctrica."
+    )
+
+
+if __name__ == "__main__":
+    main()

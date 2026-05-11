@@ -1,0 +1,340 @@
+from pathlib import Path
+import sqlite3
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+
+# =========================
+# CONFIGURACIÓN
+# =========================
+
+MACRO_DB = Path("data/db/master_energy_macro.sqlite")
+
+OUT_DIR = Path("outputs/macro/plots")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+OUT_DATA_DIR = Path("outputs/macro")
+OUT_DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+TABLE_NAME = "macro_panel_with_co2_annual"
+
+OUT_CSV = OUT_DATA_DIR / "kaya_decomposition_adapted_2006_2024.csv"
+
+
+# =========================
+# FUNCIONES AUXILIARES
+# =========================
+
+def format_year_axis(ax, years):
+    years = sorted([int(y) for y in years])
+    ax.set_xticks(years)
+    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%d"))
+    ax.tick_params(axis="x", rotation=45)
+    ax.set_xlim(min(years) - 0.5, max(years) + 0.5)
+
+
+def pct_change(last, base, col):
+    return (last[col] / base[col] - 1) * 100
+
+
+def index_2006_100(df, col):
+    base_value = df.loc[df["year"] == 2006, col].iloc[0]
+    return df[col] / base_value * 100
+
+
+def main():
+    if not MACRO_DB.exists():
+        raise FileNotFoundError(f"No encuentro la base macro: {MACRO_DB}")
+
+    with sqlite3.connect(MACRO_DB) as conn:
+        df = pd.read_sql_query(
+            f"""
+            SELECT *
+            FROM {TABLE_NAME}
+            ORDER BY year
+            """,
+            conn,
+        )
+
+    print(f"Filas leídas: {len(df)}")
+    print(f"Años: {df['year'].min()}-{df['year'].max()}")
+
+    df = df[(df["year"] >= 2006) & (df["year"] <= 2024)].copy()
+    df = df.sort_values("year").reset_index(drop=True)
+
+    expected_years = list(range(2006, 2025))
+    if df["year"].tolist() != expected_years:
+        raise ValueError(
+            "El panel no contiene exactamente los años esperados 2006-2024.\n"
+            f"Años encontrados: {df['year'].tolist()}"
+        )
+
+    # =========================
+    # FACTORES TIPO KAYA ADAPTADA
+    # =========================
+    # CO2 = (CO2 / E) * (E / PIB) * (PIB / población) * población
+    #
+    # Donde:
+    # CO2 = emisiones nacionales de CO2 excluyendo LULUCF
+    # E = demanda eléctrica peninsular anual
+    # PIB = PIB real aproximado
+    # población = población residente a 1 de enero
+
+    df["kaya_co2_mt"] = df["co2_mt_for_macro"]
+
+    # Factor 1: CO2 / demanda eléctrica peninsular
+    # Mt CO2 / TWh, equivalente a kg CO2/MWh multiplicando por 1000
+    df["kaya_co2_per_electricity_mt_per_twh"] = (
+        df["co2_mt_for_macro"] / df["electricity_demand_twh_for_macro"]
+    )
+
+    df["kaya_co2_per_electricity_kg_per_mwh"] = (
+        df["co2_mt_for_macro"] * 1000
+        / df["electricity_demand_twh_for_macro"]
+    )
+
+    # Factor 2: demanda eléctrica / PIB real
+    # TWh por millón de euros reales
+    df["kaya_electricity_per_gdp_twh_per_million_eur"] = (
+        df["electricity_demand_twh_for_macro"]
+        / df["gdp_volume_million_eur_2020_ref"]
+    )
+
+    # Para interpretación más cómoda: MWh por millón de euros reales
+    df["kaya_electricity_per_gdp_mwh_per_million_eur"] = (
+        df["electricity_demand_twh_for_macro"] * 1_000_000
+        / df["gdp_volume_million_eur_2020_ref"]
+    )
+
+    # Factor 3: PIB real per cápita
+    df["kaya_gdp_real_per_capita_eur"] = (
+        df["gdp_volume_million_eur_2020_ref"] * 1_000_000
+        / df["population_jan1"]
+    )
+
+    # Factor 4: población
+    df["kaya_population"] = df["population_jan1"]
+
+    # =========================
+    # ÍNDICES BASE 2006 = 100
+    # =========================
+
+    df["idx_co2_2006_100"] = index_2006_100(df, "kaya_co2_mt")
+
+    df["idx_co2_per_electricity_2006_100"] = index_2006_100(
+        df,
+        "kaya_co2_per_electricity_mt_per_twh"
+    )
+
+    df["idx_electricity_per_gdp_2006_100"] = index_2006_100(
+        df,
+        "kaya_electricity_per_gdp_twh_per_million_eur"
+    )
+
+    df["idx_gdp_per_capita_2006_100"] = index_2006_100(
+        df,
+        "kaya_gdp_real_per_capita_eur"
+    )
+
+    df["idx_population_2006_100"] = index_2006_100(
+        df,
+        "kaya_population"
+    )
+
+    # Reconstrucción del índice de CO2 a partir de los factores.
+    # Si la identidad está bien montada, debería coincidir casi exactamente
+    # con idx_co2_2006_100.
+    df["idx_co2_reconstructed_2006_100"] = (
+        df["idx_co2_per_electricity_2006_100"]
+        * df["idx_electricity_per_gdp_2006_100"]
+        * df["idx_gdp_per_capita_2006_100"]
+        * df["idx_population_2006_100"]
+        / (100 ** 3)
+    )
+
+    df["reconstruction_error_index_points"] = (
+        df["idx_co2_reconstructed_2006_100"]
+        - df["idx_co2_2006_100"]
+    )
+
+    max_abs_error = df["reconstruction_error_index_points"].abs().max()
+
+    # =========================
+    # GUARDAR TABLA
+    # =========================
+
+    df.to_csv(OUT_CSV, index=False, encoding="utf-8")
+
+    # =========================
+    # GRÁFICO 1: DESCOMPOSICIÓN TIPO KAYA
+    # =========================
+
+    fig, ax = plt.subplots(figsize=(11, 6))
+
+    ax.plot(
+        df["year"],
+        df["idx_co2_2006_100"],
+        marker="o",
+        linewidth=2.5,
+        label="CO₂ total excl. LULUCF",
+    )
+
+    ax.plot(
+        df["year"],
+        df["idx_co2_per_electricity_2006_100"],
+        marker="o",
+        linewidth=2,
+        label="CO₂ / demanda eléctrica",
+    )
+
+    ax.plot(
+        df["year"],
+        df["idx_electricity_per_gdp_2006_100"],
+        marker="o",
+        linewidth=2,
+        label="Demanda eléctrica / PIB real",
+    )
+
+    ax.plot(
+        df["year"],
+        df["idx_gdp_per_capita_2006_100"],
+        marker="o",
+        linewidth=2,
+        label="PIB real per cápita",
+    )
+
+    ax.plot(
+        df["year"],
+        df["idx_population_2006_100"],
+        marker="o",
+        linewidth=2,
+        label="Población",
+    )
+
+    ax.axhline(100, linewidth=1, linestyle="--", alpha=0.5)
+
+    ax.set_title(
+        "Descomposición tipo Kaya adaptada\n"
+        "CO₂ = (CO₂/E) · (E/PIB) · (PIB/población) · población"
+    )
+    ax.set_xlabel("Año")
+    ax.set_ylabel("Índice 2006 = 100")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    format_year_axis(ax, df["year"])
+
+    fig.tight_layout()
+    path1 = OUT_DIR / "10_kaya_decomposition_adapted_indices_2006_100.png"
+    fig.savefig(path1, dpi=200)
+    plt.close(fig)
+
+    # =========================
+    # GRÁFICO 2: CAMBIO 2006-2024 DE CADA FACTOR
+    # =========================
+
+    base = df[df["year"] == 2006].iloc[0]
+    last = df[df["year"] == 2024].iloc[0]
+
+    changes = pd.DataFrame(
+        {
+            "factor": [
+                "CO₂ total",
+                "CO₂ / demanda eléctrica",
+                "Demanda eléctrica / PIB real",
+                "PIB real per cápita",
+                "Población",
+            ],
+            "change_pct": [
+                pct_change(last, base, "kaya_co2_mt"),
+                pct_change(last, base, "kaya_co2_per_electricity_mt_per_twh"),
+                pct_change(last, base, "kaya_electricity_per_gdp_twh_per_million_eur"),
+                pct_change(last, base, "kaya_gdp_real_per_capita_eur"),
+                pct_change(last, base, "kaya_population"),
+            ],
+        }
+    )
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+
+    ax.bar(
+        changes["factor"],
+        changes["change_pct"],
+    )
+
+    ax.axhline(0, linewidth=1)
+    ax.set_title("Cambio acumulado 2006-2024 de los factores tipo Kaya")
+    ax.set_ylabel("Cambio porcentual (%)")
+    ax.tick_params(axis="x", rotation=25)
+    ax.grid(True, axis="y", alpha=0.3)
+
+    fig.tight_layout()
+    path2 = OUT_DIR / "11_kaya_factor_changes_2006_2024.png"
+    fig.savefig(path2, dpi=200)
+    plt.close(fig)
+
+    # =========================
+    # RESULTADOS POR CONSOLA
+    # =========================
+
+    print("\nArchivos generados:")
+    print(f"- CSV: {OUT_CSV}")
+    print(f"- Gráfico 1: {path1}")
+    print(f"- Gráfico 2: {path2}")
+
+    print("\nComprobación de reconstrucción:")
+    print(
+        "- Error máximo entre CO2 observado y CO2 reconstruido "
+        f"con los factores: {max_abs_error:.10f} puntos de índice"
+    )
+
+    print("\nResumen de cambios 2006-2024:")
+    print(
+        f"- CO2 total excl. LULUCF: "
+        f"{pct_change(last, base, 'kaya_co2_mt'):.2f}%"
+    )
+    print(
+        f"- CO2 / demanda eléctrica peninsular: "
+        f"{pct_change(last, base, 'kaya_co2_per_electricity_mt_per_twh'):.2f}%"
+    )
+    print(
+        f"- Demanda eléctrica / PIB real: "
+        f"{pct_change(last, base, 'kaya_electricity_per_gdp_twh_per_million_eur'):.2f}%"
+    )
+    print(
+        f"- PIB real per cápita: "
+        f"{pct_change(last, base, 'kaya_gdp_real_per_capita_eur'):.2f}%"
+    )
+    print(
+        f"- Población: "
+        f"{pct_change(last, base, 'kaya_population'):.2f}%"
+    )
+
+    print("\nValores 2024 en índice 2006 = 100:")
+    print(
+        df.loc[
+            df["year"] == 2024,
+            [
+                "idx_co2_2006_100",
+                "idx_co2_per_electricity_2006_100",
+                "idx_electricity_per_gdp_2006_100",
+                "idx_gdp_per_capita_2006_100",
+                "idx_population_2006_100",
+                "idx_co2_reconstructed_2006_100",
+            ],
+        ].to_string(index=False)
+    )
+
+    print("\nNota metodológica:")
+    print(
+        "Esta es una descomposición tipo Kaya adaptada. No se usa energía total "
+        "nacional, sino demanda eléctrica peninsular. Por tanto, el factor "
+        "CO2/demanda eléctrica debe interpretarse como indicador contextual, "
+        "no como intensidad real del sistema eléctrico."
+    )
+
+
+if __name__ == "__main__":
+    main()

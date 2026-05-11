@@ -1,0 +1,208 @@
+from pathlib import Path
+import sqlite3
+
+import pandas as pd
+
+
+# =========================
+# CONFIGURACIÓN
+# =========================
+
+MACRO_DB = Path("data/db/master_energy_macro.sqlite")
+
+OUT_DIR = Path("outputs/macro")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+OUT_CSV = OUT_DIR / "macro_panel_with_co2_2006_2024.csv"
+
+BASE_PANEL_TABLE = "macro_panel_gdp_population_demand_annual"
+CO2_TABLE = "macro_co2_spain_annual"
+OUT_TABLE = "macro_panel_with_co2_annual"
+
+
+def pct_change(last, base, col):
+    return (last[col] / base[col] - 1) * 100
+
+
+def main():
+    if not MACRO_DB.exists():
+        raise FileNotFoundError(f"No encuentro la base macro: {MACRO_DB}")
+
+    with sqlite3.connect(MACRO_DB) as conn:
+        macro = pd.read_sql_query(
+            f"""
+            SELECT *
+            FROM {BASE_PANEL_TABLE}
+            ORDER BY year
+            """,
+            conn,
+        )
+
+        co2 = pd.read_sql_query(
+            f"""
+            SELECT *
+            FROM {CO2_TABLE}
+            ORDER BY year
+            """,
+            conn,
+        )
+
+    print(f"Filas panel macro leídas: {len(macro)}")
+    print(f"Filas CO2 leídas: {len(co2)}")
+
+    # =========================
+    # UNIÓN
+    # =========================
+
+    df = macro.merge(co2, on="year", how="inner")
+
+    df = df[(df["year"] >= 2006) & (df["year"] <= 2024)].copy()
+    df = df.sort_values("year").reset_index(drop=True)
+
+    expected_years = list(range(2006, 2025))
+
+    if df["year"].tolist() != expected_years:
+        raise ValueError(
+            "El panel con CO2 no tiene exactamente los años esperados.\n"
+            f"Esperado: {expected_years}\n"
+            f"Encontrado: {df['year'].tolist()}"
+        )
+
+    # =========================
+    # VARIABLE PRINCIPAL DE CO2
+    # =========================
+
+    df["co2_mt_for_macro"] = df["co2_excl_lulucf_mt"]
+
+    # =========================
+    # INDICADORES CO2
+    # =========================
+
+    # CO2 per cápita
+    # 1 Mt = 1.000.000 t
+    df["co2_t_per_capita"] = (
+        df["co2_mt_for_macro"] * 1_000_000 / df["population_jan1"]
+    )
+
+    # CO2 respecto al PIB real aproximado
+    # Resultado: toneladas de CO2 por millón de euros de PIB real
+    df["co2_t_per_million_eur_volume_2020"] = (
+        df["co2_mt_for_macro"] * 1_000_000
+        / df["gdp_volume_million_eur_2020_ref"]
+    )
+
+    # CO2 respecto al PIB corriente
+    # Menos importante, pero lo dejamos para comparación
+    df["co2_t_per_million_eur_current"] = (
+        df["co2_mt_for_macro"] * 1_000_000
+        / df["gdp_current_million_eur"]
+    )
+
+    # CO2 respecto a demanda eléctrica peninsular
+    # OJO: indicador de contexto, NO intensidad real del sistema eléctrico.
+    # 1 Mt = 1e9 kg
+    # 1 TWh = 1e6 MWh
+    # kg/MWh = Mt * 1000 / TWh
+    df["co2_kg_per_mwh_electricity_context"] = (
+        df["co2_mt_for_macro"] * 1000
+        / df["electricity_demand_twh_for_macro"]
+    )
+
+    # =========================
+    # ÍNDICES BASE 2006 = 100
+    # =========================
+
+    base = df[df["year"] == 2006].iloc[0]
+
+    df["co2_index_2006_100"] = (
+        df["co2_mt_for_macro"] / base["co2_mt_for_macro"] * 100
+    )
+
+    df["co2_per_capita_index_2006_100"] = (
+        df["co2_t_per_capita"] / base["co2_t_per_capita"] * 100
+    )
+
+    df["co2_per_gdp_real_index_2006_100"] = (
+        df["co2_t_per_million_eur_volume_2020"]
+        / base["co2_t_per_million_eur_volume_2020"]
+        * 100
+    )
+
+    df["co2_per_electricity_context_index_2006_100"] = (
+        df["co2_kg_per_mwh_electricity_context"]
+        / base["co2_kg_per_mwh_electricity_context"]
+        * 100
+    )
+
+    # =========================
+    # GUARDAR
+    # =========================
+
+    df.to_csv(OUT_CSV, index=False, encoding="utf-8")
+
+    with sqlite3.connect(MACRO_DB) as conn:
+        df.to_sql(OUT_TABLE, conn, if_exists="replace", index=False)
+
+    print("\nPanel con CO2 creado correctamente:")
+    print(f"- CSV: {OUT_CSV}")
+    print(f"- Tabla SQLite: {OUT_TABLE}")
+
+    print("\nResumen panel CO2:")
+    print(
+        df[
+            [
+                "year",
+                "electricity_demand_twh_for_macro",
+                "gdp_volume_index_2020_100",
+                "population_jan1",
+                "co2_mt_for_macro",
+                "co2_t_per_capita",
+                "co2_t_per_million_eur_volume_2020",
+                "co2_kg_per_mwh_electricity_context",
+            ]
+        ].to_string(index=False)
+    )
+
+    last = df[df["year"] == 2024].iloc[0]
+
+    print("\nResumen de cambios 2006-2024:")
+    print(
+        f"- Demanda eléctrica: "
+        f"{pct_change(last, base, 'electricity_demand_twh_for_macro'):.2f}%"
+    )
+    print(
+        f"- PIB real aprox.: "
+        f"{pct_change(last, base, 'gdp_volume_million_eur_2020_ref'):.2f}%"
+    )
+    print(
+        f"- Población: "
+        f"{pct_change(last, base, 'population_jan1'):.2f}%"
+    )
+    print(
+        f"- CO2 excl. LULUCF: "
+        f"{pct_change(last, base, 'co2_mt_for_macro'):.2f}%"
+    )
+    print(
+        f"- CO2 per cápita: "
+        f"{pct_change(last, base, 'co2_t_per_capita'):.2f}%"
+    )
+    print(
+        f"- CO2 / PIB real: "
+        f"{pct_change(last, base, 'co2_t_per_million_eur_volume_2020'):.2f}%"
+    )
+    print(
+        f"- CO2 / demanda eléctrica peninsular contexto: "
+        f"{pct_change(last, base, 'co2_kg_per_mwh_electricity_context'):.2f}%"
+    )
+
+    print("\nNota metodológica:")
+    print(
+        "El indicador CO2 / demanda eléctrica peninsular se interpreta solo como "
+        "indicador macro de contexto. No representa la intensidad real de carbono "
+        "del sistema eléctrico, porque el CO2 usado es el total nacional excluyendo "
+        "LULUCF, no solo el CO2 del sector eléctrico."
+    )
+
+
+if __name__ == "__main__":
+    main()

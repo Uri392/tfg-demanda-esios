@@ -1,0 +1,33 @@
+import sqlite3
+import pandas as pd
+import os
+
+DB_PATH = r"data\db\master_energy.sqlite"
+OUT_DIR = r"exports"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+con = sqlite3.connect(DB_PATH)
+
+# Export DEMANDA
+df_d = pd.read_sql("""
+SELECT timestamp_utc, demand_mw, source
+FROM demand_peninsula_hourly
+ORDER BY timestamp_utc;
+""", con)
+
+out_d = os.path.join(OUT_DIR, "demand_peninsula_hourly_2006_2025.csv")
+df_d.to_csv(out_d, index=False)
+print("✅ Guardado:", out_d, "| filas:", len(df_d))
+
+# Export TEMPERATURA
+df_t = pd.read_sql("""
+SELECT timestamp_utc, temp_c, source
+FROM temperature_peninsula_hourly
+ORDER BY timestamp_utc;
+""", con)
+
+out_t = os.path.join(OUT_DIR, "temperature_peninsula_hourly_2006_2025.csv")
+df_t.to_csv(out_t, index=False)
+print("✅ Guardado:", out_t, "| filas:", len(df_t))
+
+con.close()

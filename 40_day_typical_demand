@@ -1,0 +1,23 @@
+import sqlite3
+import pandas as pd
+
+DB_PATH = r"data\db\master_energy.sqlite"
+
+con = sqlite3.connect(DB_PATH)
+
+# Perfil medio por hora del día (día típico)
+df = pd.read_sql("""
+SELECT
+  CAST(substr(timestamp_utc, 12, 2) AS INTEGER) AS hour,
+  AVG(demand_mw) AS mean_demand_mw
+FROM demand_peninsula_hourly
+GROUP BY hour
+ORDER BY hour;
+""", con)
+
+con.close()
+
+df["mean_demand_mw"] = df["mean_demand_mw"].round(1)
+
+print("=== DIA TIPICO (DEMANDA MEDIA POR HORA) ===")
+print(df.to_string(index=False))

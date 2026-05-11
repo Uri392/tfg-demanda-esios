@@ -1,0 +1,331 @@
+from pathlib import Path
+import sqlite3
+
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
+
+
+# =========================
+# CONFIGURACIÓN
+# =========================
+
+MACRO_DB = Path("data/db/master_energy_macro.sqlite")
+OUT_DIR = Path("outputs/macro/plots")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+TABLE_NAME = "macro_panel_gdp_population_demand_annual"
+
+
+# =========================
+# FUNCIONES AUXILIARES
+# =========================
+
+def format_year_axis(ax, years):
+    """
+    Fuerza el eje X a mostrar años enteros.
+    """
+    years = sorted([int(y) for y in years])
+
+    ax.set_xticks(years)
+    ax.xaxis.set_major_formatter(mticker.FormatStrFormatter("%d"))
+    ax.tick_params(axis="x", rotation=45)
+    ax.set_xlim(min(years) - 0.5, max(years) + 0.5)
+
+
+def add_2025_note(ax):
+    """
+    Marca 2025 como año provisional/metodológicamente especial.
+    """
+    ax.axvline(2025, linestyle="--", linewidth=1, alpha=0.5)
+
+    ax.text(
+        2025,
+        0.98,
+        "2025*",
+        transform=ax.get_xaxis_transform(),
+        va="top",
+        ha="right",
+        fontsize=9,
+    )
+
+
+def pct_change(row_final, row_base, col):
+    return (row_final[col] / row_base[col] - 1) * 100
+
+
+def main():
+    if not MACRO_DB.exists():
+        raise FileNotFoundError(f"No encuentro la base macro: {MACRO_DB}")
+
+    with sqlite3.connect(MACRO_DB) as conn:
+        df = pd.read_sql_query(
+            f"""
+            SELECT *
+            FROM {TABLE_NAME}
+            ORDER BY year
+            """,
+            conn,
+        )
+
+    print(f"Filas leídas: {len(df)}")
+    print(f"Años: {df['year'].min()}-{df['year'].max()}")
+
+    # =========================
+    # ÍNDICES BASE 2006 = 100
+    # =========================
+
+    base_year = 2006
+    base = df[df["year"] == base_year].iloc[0]
+
+    df["demand_index_2006_100"] = (
+        df["electricity_demand_twh_for_macro"]
+        / base["electricity_demand_twh_for_macro"]
+        * 100
+    )
+
+    df["gdp_volume_index_2006_100"] = (
+        df["gdp_volume_million_eur_2020_ref"]
+        / base["gdp_volume_million_eur_2020_ref"]
+        * 100
+    )
+
+    df["population_index_2006_100"] = (
+        df["population_jan1"]
+        / base["population_jan1"]
+        * 100
+    )
+
+    df["electricity_intensity_index_2006_100"] = (
+        df["electricity_mwh_per_million_eur_volume_2020"]
+        / base["electricity_mwh_per_million_eur_volume_2020"]
+        * 100
+    )
+
+    df["electricity_per_capita_index_2006_100"] = (
+        df["electricity_mwh_per_capita"]
+        / base["electricity_mwh_per_capita"]
+        * 100
+    )
+
+    df["gdp_per_capita_real_index_2006_100"] = (
+        df["gdp_volume_2020_eur_per_capita"]
+        / base["gdp_volume_2020_eur_per_capita"]
+        * 100
+    )
+
+    # Guardar CSV con índices
+    out_csv = OUT_DIR / "macro_panel_with_indices_2006_100.csv"
+    df.to_csv(out_csv, index=False, encoding="utf-8")
+
+    years = df["year"]
+
+    # =========================
+    # GRÁFICO 1: DEMANDA ANUAL
+    # =========================
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+
+    ax.plot(
+        df["year"],
+        df["electricity_demand_twh_for_macro"],
+        marker="o",
+        linewidth=2,
+    )
+
+    ax.set_title("Demanda eléctrica peninsular anual")
+    ax.set_xlabel("Año")
+    ax.set_ylabel("Demanda eléctrica (TWh)")
+    ax.grid(True, alpha=0.3)
+
+    add_2025_note(ax)
+    format_year_axis(ax, years)
+
+    fig.tight_layout()
+    path1 = OUT_DIR / "01_electricity_demand_twh_annual.png"
+    fig.savefig(path1, dpi=200)
+    plt.close(fig)
+
+    # =========================
+    # GRÁFICO 2: DEMANDA VS PIB VS POBLACIÓN
+    # =========================
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+
+    ax.plot(
+        df["year"],
+        df["demand_index_2006_100"],
+        marker="o",
+        linewidth=2,
+        label="Demanda eléctrica peninsular",
+    )
+
+    ax.plot(
+        df["year"],
+        df["gdp_volume_index_2006_100"],
+        marker="o",
+        linewidth=2,
+        label="PIB real aprox.",
+    )
+
+    ax.plot(
+        df["year"],
+        df["population_index_2006_100"],
+        marker="o",
+        linewidth=2,
+        label="Población",
+    )
+
+    ax.set_title("Demanda eléctrica, PIB real y población\nÍndice base 2006 = 100")
+    ax.set_xlabel("Año")
+    ax.set_ylabel("Índice 2006 = 100")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    add_2025_note(ax)
+    format_year_axis(ax, years)
+
+    fig.tight_layout()
+    path2 = OUT_DIR / "02_demand_gdp_population_indices_2006_100.png"
+    fig.savefig(path2, dpi=200)
+    plt.close(fig)
+
+    # =========================
+    # GRÁFICO 3: INTENSIDAD ELÉCTRICA
+    # =========================
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+
+    ax.plot(
+        df["year"],
+        df["electricity_mwh_per_million_eur_volume_2020"],
+        marker="o",
+        linewidth=2,
+    )
+
+    ax.set_title("Intensidad eléctrica real de la economía")
+    ax.set_xlabel("Año")
+    ax.set_ylabel("MWh por millón de euros de PIB real")
+    ax.grid(True, alpha=0.3)
+
+    add_2025_note(ax)
+    format_year_axis(ax, years)
+
+    fig.tight_layout()
+    path3 = OUT_DIR / "03_electricity_intensity_real_mwh_per_million_eur.png"
+    fig.savefig(path3, dpi=200)
+    plt.close(fig)
+
+    # =========================
+    # GRÁFICO 4: PER CÁPITA
+    # =========================
+
+    fig, ax = plt.subplots(figsize=(10, 5.5))
+
+    ax.plot(
+        df["year"],
+        df["electricity_per_capita_index_2006_100"],
+        marker="o",
+        linewidth=2,
+        label="Demanda eléctrica per cápita",
+    )
+
+    ax.plot(
+        df["year"],
+        df["gdp_per_capita_real_index_2006_100"],
+        marker="o",
+        linewidth=2,
+        label="PIB real per cápita",
+    )
+
+    ax.set_title("Indicadores per cápita\nÍndice base 2006 = 100")
+    ax.set_xlabel("Año")
+    ax.set_ylabel("Índice 2006 = 100")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+
+    add_2025_note(ax)
+    format_year_axis(ax, years)
+
+    fig.tight_layout()
+    path4 = OUT_DIR / "04_per_capita_indices_2006_100.png"
+    fig.savefig(path4, dpi=200)
+    plt.close(fig)
+
+    # =========================
+    # RESÚMENES NUMÉRICOS
+    # =========================
+
+    last_2025 = df[df["year"] == 2025].iloc[0]
+    last_2024 = df[df["year"] == 2024].iloc[0]
+
+    print("\nGráficos generados:")
+    print(f"- {path1}")
+    print(f"- {path2}")
+    print(f"- {path3}")
+    print(f"- {path4}")
+    print(f"- {out_csv}")
+
+    print("\nResumen de cambios 2006-2025:")
+    print(
+        f"- Demanda eléctrica: "
+        f"{pct_change(last_2025, base, 'electricity_demand_twh_for_macro'):.2f}%"
+    )
+    print(
+        f"- PIB real aprox.: "
+        f"{pct_change(last_2025, base, 'gdp_volume_million_eur_2020_ref'):.2f}%"
+    )
+    print(
+        f"- Población: "
+        f"{pct_change(last_2025, base, 'population_jan1'):.2f}%"
+    )
+    print(
+        f"- Intensidad eléctrica real: "
+        f"{pct_change(last_2025, base, 'electricity_mwh_per_million_eur_volume_2020'):.2f}%"
+    )
+    print(
+        f"- Demanda eléctrica per cápita: "
+        f"{pct_change(last_2025, base, 'electricity_mwh_per_capita'):.2f}%"
+    )
+    print(
+        f"- PIB real per cápita: "
+        f"{pct_change(last_2025, base, 'gdp_volume_2020_eur_per_capita'):.2f}%"
+    )
+
+    print("\nResumen de cambios 2006-2024:")
+    print(
+        f"- Demanda eléctrica: "
+        f"{pct_change(last_2024, base, 'electricity_demand_twh_for_macro'):.2f}%"
+    )
+    print(
+        f"- PIB real aprox.: "
+        f"{pct_change(last_2024, base, 'gdp_volume_million_eur_2020_ref'):.2f}%"
+    )
+    print(
+        f"- Población: "
+        f"{pct_change(last_2024, base, 'population_jan1'):.2f}%"
+    )
+    print(
+        f"- Intensidad eléctrica real: "
+        f"{pct_change(last_2024, base, 'electricity_mwh_per_million_eur_volume_2020'):.2f}%"
+    )
+    print(
+        f"- Demanda eléctrica per cápita: "
+        f"{pct_change(last_2024, base, 'electricity_mwh_per_capita'):.2f}%"
+    )
+    print(
+        f"- PIB real per cápita: "
+        f"{pct_change(last_2024, base, 'gdp_volume_2020_eur_per_capita'):.2f}%"
+    )
+
+    print("\nNota metodológica:")
+    print(
+        "2025 aparece marcado con asterisco porque el PIB de 2025 procede "
+        "de una estimación de la Contabilidad Nacional Trimestral y no de la "
+        "serie anual consolidada. Además, la población se ha tomado a 1 de enero "
+        "de cada año."
+    )
+
+
+if __name__ == "__main__":
+    main()

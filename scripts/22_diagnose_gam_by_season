@@ -1,0 +1,683 @@
+from pathlib import Path
+import sqlite3
+import sys
+
+import numpy as np
+import pandas as pd
+
+try:
+    from pygam import LinearGAM, s, f, te
+except ImportError:
+    print("ERROR: No tienes instalado pygam.")
+    print("Instálalo con:")
+    print(r".\.venv\Scripts\python.exe -m pip install pygam")
+    sys.exit(1)
+
+
+# ============================================================
+# CONFIGURACIÓN
+# ============================================================
+
+DB_PATH = Path("data/db/master_energy.sqlite")
+OUT_DIR = Path("outputs/modeling/gam_by_season_diagnostics")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+TRAIN_END_YEAR = 2020
+TEST_START_YEAR = 2021
+LOW_DEMAND_THRESHOLD = 15000
+
+SEASON_ORDER = ["DJF", "MAM", "JJA", "SON"]
+
+
+# ============================================================
+# MÉTRICAS
+# ============================================================
+
+def rmse(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return np.sqrt(np.mean((y_true - y_pred) ** 2))
+
+
+def mae(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return np.mean(np.abs(y_true - y_pred))
+
+
+def r2_score_manual(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+
+    if ss_tot == 0:
+        return np.nan
+
+    return 1 - ss_res / ss_tot
+
+
+def evaluate_model(name, season, y_train, pred_train, y_test, pred_test):
+    return {
+        "season": season,
+        "model": name,
+        "r2_train": r2_score_manual(y_train, pred_train),
+        "r2_test": r2_score_manual(y_test, pred_test),
+        "rmse_train_mw": rmse(y_train, pred_train),
+        "rmse_test_mw": rmse(y_test, pred_test),
+        "mae_train_mw": mae(y_train, pred_train),
+        "mae_test_mw": mae(y_test, pred_test),
+    }
+
+
+# ============================================================
+# CARGA DE DATOS
+# ============================================================
+
+def load_data():
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"No existe la base de datos: {DB_PATH}")
+
+    conn = sqlite3.connect(DB_PATH)
+
+    tables = pd.read_sql(
+        "SELECT name FROM sqlite_master WHERE type='table';",
+        conn
+    )["name"].tolist()
+
+    print("\nTablas encontradas en la base de datos:")
+    for table in tables:
+        print(f"- {table}")
+
+    required_tables = {
+        "demand_peninsula_hourly",
+        "temperature_peninsula_hourly",
+    }
+
+    missing_tables = required_tables - set(tables)
+
+    if missing_tables:
+        conn.close()
+        raise ValueError(f"Faltan tablas necesarias: {missing_tables}")
+
+    demand = pd.read_sql(
+        """
+        SELECT timestamp_utc, demand_mw
+        FROM demand_peninsula_hourly
+        ORDER BY timestamp_utc
+        """,
+        conn
+    )
+
+    temp = pd.read_sql(
+        """
+        SELECT timestamp_utc, temp_c
+        FROM temperature_peninsula_hourly
+        ORDER BY timestamp_utc
+        """,
+        conn
+    )
+
+    conn.close()
+
+    demand["timestamp_utc"] = pd.to_datetime(demand["timestamp_utc"], utc=True)
+    temp["timestamp_utc"] = pd.to_datetime(temp["timestamp_utc"], utc=True)
+
+    demand["demand_mw"] = pd.to_numeric(demand["demand_mw"], errors="coerce")
+    temp["temp_c"] = pd.to_numeric(temp["temp_c"], errors="coerce")
+
+    demand = demand.dropna(subset=["timestamp_utc", "demand_mw"]).copy()
+    temp = temp.dropna(subset=["timestamp_utc", "temp_c"]).copy()
+
+    # Por seguridad, si hubiera duplicados horarios, agregamos por timestamp
+    demand = demand.groupby("timestamp_utc", as_index=False)["demand_mw"].mean()
+    temp = temp.groupby("timestamp_utc", as_index=False)["temp_c"].mean()
+
+    print("\nFilas leídas:")
+    print(f"- Demanda:     {len(demand):,}")
+    print(f"- Temperatura: {len(temp):,}")
+
+    df = pd.merge(
+        demand,
+        temp,
+        on="timestamp_utc",
+        how="inner"
+    )
+
+    df = df.sort_values("timestamp_utc").reset_index(drop=True)
+
+    print("\nTras unir demanda y temperatura:")
+    print(f"- Filas unidas: {len(df):,}")
+    print(f"- Fecha mínima: {df['timestamp_utc'].min()}")
+    print(f"- Fecha máxima: {df['timestamp_utc'].max()}")
+
+    if len(df) == 0:
+        raise ValueError(
+            "La unión entre demanda y temperatura ha dado 0 filas. "
+            "Los timestamp_utc no coinciden entre ambas tablas."
+        )
+
+    return df
+
+
+# ============================================================
+# CALENDARIO Y VARIABLES
+# ============================================================
+
+def get_season(month):
+    if month in [12, 1, 2]:
+        return "DJF"
+    if month in [3, 4, 5]:
+        return "MAM"
+    if month in [6, 7, 8]:
+        return "JJA"
+    if month in [9, 10, 11]:
+        return "SON"
+    return None
+
+
+def build_holiday_calendar(years):
+    """
+    Intenta usar la librería holidays.
+    Si no está instalada, usa una lista manual básica de festivos nacionales fijos.
+    """
+
+    holiday_dict = {}
+
+    try:
+        import holidays
+
+        es_holidays = holidays.Spain(years=years)
+
+        for date_value, name in es_holidays.items():
+            holiday_dict[date_value] = str(name)
+
+        print("\nFestivos cargados con librería holidays.")
+
+    except ImportError:
+        print("\nAVISO: librería holidays no instalada.")
+        print("Se usará calendario manual básico de festivos nacionales fijos.")
+
+        for year in years:
+            fixed_holidays = {
+                pd.Timestamp(f"{year}-01-01").date(): "Año Nuevo",
+                pd.Timestamp(f"{year}-01-06").date(): "Epifanía",
+                pd.Timestamp(f"{year}-05-01").date(): "Día del Trabajador",
+                pd.Timestamp(f"{year}-08-15").date(): "Asunción de la Virgen",
+                pd.Timestamp(f"{year}-10-12").date(): "Fiesta Nacional de España",
+                pd.Timestamp(f"{year}-11-01").date(): "Todos los Santos",
+                pd.Timestamp(f"{year}-12-06").date(): "Día de la Constitución",
+                pd.Timestamp(f"{year}-12-08").date(): "Inmaculada Concepción",
+                pd.Timestamp(f"{year}-12-25").date(): "Navidad",
+            }
+
+            holiday_dict.update(fixed_holidays)
+
+    return holiday_dict
+
+
+def add_features(df):
+    df = df.copy()
+
+    # Hora local peninsular
+    df["timestamp_madrid"] = df["timestamp_utc"].dt.tz_convert("Europe/Madrid")
+
+    df["local_year"] = df["timestamp_madrid"].dt.year
+    df["local_month"] = df["timestamp_madrid"].dt.month
+    df["local_day"] = df["timestamp_madrid"].dt.day
+    df["local_hour"] = df["timestamp_madrid"].dt.hour
+    df["local_day_of_week"] = df["timestamp_madrid"].dt.dayofweek
+    df["local_date"] = df["timestamp_madrid"].dt.date
+    df["year_month"] = df["timestamp_madrid"].dt.strftime("%Y-%m")
+
+    df["season"] = df["local_month"].apply(get_season)
+
+    df["is_weekend"] = df["local_day_of_week"].isin([5, 6]).astype(int)
+
+    years = sorted(df["local_year"].unique())
+    holiday_dict = build_holiday_calendar(years)
+
+    df["is_holiday_es"] = df["local_date"].apply(
+        lambda d: int(d in holiday_dict)
+    )
+
+    df["holiday_name"] = df["local_date"].apply(
+        lambda d: holiday_dict.get(d, "")
+    )
+
+    df["is_non_working_day_basic"] = (
+        (df["is_weekend"] == 1) | (df["is_holiday_es"] == 1)
+    ).astype(int)
+
+    # Índice temporal continuo para posible tendencia
+    first_timestamp = df["timestamp_utc"].min()
+    df["time_idx_years"] = (
+        (df["timestamp_utc"] - first_timestamp).dt.total_seconds()
+        / (365.25 * 24 * 3600)
+    )
+
+    # Variables de inercia térmica
+    df = df.sort_values("timestamp_utc").reset_index(drop=True)
+
+    df["temp_lag24"] = df["temp_c"].shift(24)
+    df["temp_mean_24h_prev"] = (
+        df["temp_c"]
+        .shift(1)
+        .rolling(window=24, min_periods=24)
+        .mean()
+    )
+
+    return df
+
+
+# ============================================================
+# MODELOS GAM
+# ============================================================
+
+def fit_gam_no_trend(train, test):
+    feature_cols = [
+        "temp_c",
+        "local_hour",
+        "local_day_of_week",
+        "local_month",
+        "is_holiday_es",
+        "temp_lag24",
+        "temp_mean_24h_prev",
+        "local_hour_cont",
+    ]
+
+    X_train = train[feature_cols].to_numpy()
+    y_train = train["demand_mw"].to_numpy()
+
+    X_test = test[feature_cols].to_numpy()
+
+    terms = (
+        s(0, n_splines=12) +
+        f(1) +
+        f(2) +
+        f(3) +
+        f(4) +
+        s(5, n_splines=10) +
+        s(6, n_splines=10) +
+        te(0, 7, n_splines=[10, 8])
+    )
+
+    gam = LinearGAM(terms).fit(X_train, y_train)
+
+    return gam.predict(X_train), gam.predict(X_test)
+
+
+def fit_gam_with_trend(train, test):
+    feature_cols = [
+        "temp_c",
+        "local_hour",
+        "local_day_of_week",
+        "local_month",
+        "is_holiday_es",
+        "temp_lag24",
+        "temp_mean_24h_prev",
+        "local_hour_cont",
+        "time_idx_years",
+    ]
+
+    X_train = train[feature_cols].to_numpy()
+    y_train = train["demand_mw"].to_numpy()
+
+    X_test = test[feature_cols].to_numpy()
+
+    terms = (
+        s(0, n_splines=12) +
+        f(1) +
+        f(2) +
+        f(3) +
+        f(4) +
+        s(5, n_splines=10) +
+        s(6, n_splines=10) +
+        te(0, 7, n_splines=[10, 8]) +
+        s(8, n_splines=10)
+    )
+
+    gam = LinearGAM(terms).fit(X_train, y_train)
+
+    return gam.predict(X_train), gam.predict(X_test)
+
+
+# ============================================================
+# DIAGNÓSTICOS
+# ============================================================
+
+def describe_train_test(season, train, test):
+    row = {
+        "season": season,
+        "n_train": len(train),
+        "n_test": len(test),
+
+        "train_year_min": train["local_year"].min(),
+        "train_year_max": train["local_year"].max(),
+        "test_year_min": test["local_year"].min(),
+        "test_year_max": test["local_year"].max(),
+
+        "train_temp_min": train["temp_c"].min(),
+        "train_temp_p01": train["temp_c"].quantile(0.01),
+        "train_temp_mean": train["temp_c"].mean(),
+        "train_temp_p99": train["temp_c"].quantile(0.99),
+        "train_temp_max": train["temp_c"].max(),
+
+        "test_temp_min": test["temp_c"].min(),
+        "test_temp_p01": test["temp_c"].quantile(0.01),
+        "test_temp_mean": test["temp_c"].mean(),
+        "test_temp_p99": test["temp_c"].quantile(0.99),
+        "test_temp_max": test["temp_c"].max(),
+
+        "train_demand_min": train["demand_mw"].min(),
+        "train_demand_mean": train["demand_mw"].mean(),
+        "train_demand_max": train["demand_mw"].max(),
+
+        "test_demand_min": test["demand_mw"].min(),
+        "test_demand_mean": test["demand_mw"].mean(),
+        "test_demand_max": test["demand_mw"].max(),
+    }
+
+    row["test_temp_below_train_min"] = int(row["test_temp_min"] < row["train_temp_min"])
+    row["test_temp_above_train_max"] = int(row["test_temp_max"] > row["train_temp_max"])
+
+    return row
+
+
+def prediction_diagnostics(season, model_name, test, pred):
+    pred = np.asarray(pred)
+    y = test["demand_mw"].to_numpy()
+
+    row = {
+        "season": season,
+        "model": model_name,
+        "pred_min": pred.min(),
+        "pred_p01": np.quantile(pred, 0.01),
+        "pred_mean": pred.mean(),
+        "pred_p99": np.quantile(pred, 0.99),
+        "pred_max": pred.max(),
+        "obs_min": y.min(),
+        "obs_mean": y.mean(),
+        "obs_max": y.max(),
+        "n_pred_negative": int(np.sum(pred < 0)),
+        "n_pred_below_10000": int(np.sum(pred < 10000)),
+        "n_pred_above_50000": int(np.sum(pred > 50000)),
+        "n_pred_above_70000": int(np.sum(pred > 70000)),
+        "max_abs_error": np.max(np.abs(y - pred)),
+    }
+
+    return row
+
+
+def top_errors(season, model_name, test, pred, n=10):
+    tmp = test.copy()
+    tmp["model"] = model_name
+    tmp["predicted_mw"] = pred
+    tmp["error_mw"] = tmp["demand_mw"] - tmp["predicted_mw"]
+    tmp["abs_error_mw"] = tmp["error_mw"].abs()
+
+    cols = [
+        "season",
+        "model",
+        "timestamp_utc",
+        "timestamp_madrid",
+        "local_year",
+        "year_month",
+        "local_month",
+        "local_day_of_week",
+        "local_hour",
+        "is_holiday_es",
+        "holiday_name",
+        "temp_c",
+        "temp_lag24",
+        "temp_mean_24h_prev",
+        "demand_mw",
+        "predicted_mw",
+        "error_mw",
+        "abs_error_mw",
+    ]
+
+    return tmp.sort_values("abs_error_mw", ascending=False).head(n)[cols]
+
+
+def monthly_errors(season, model_name, test, pred):
+    tmp = test.copy()
+    tmp["model"] = model_name
+    tmp["predicted_mw"] = pred
+    tmp["error_mw"] = tmp["demand_mw"] - tmp["predicted_mw"]
+    tmp["abs_error_mw"] = tmp["error_mw"].abs()
+
+    out = (
+        tmp.groupby("year_month")
+        .agg(
+            season=("season", "first"),
+            model=("model", "first"),
+            n_obs=("demand_mw", "size"),
+            observed_mean_mw=("demand_mw", "mean"),
+            predicted_mean_mw=("predicted_mw", "mean"),
+            bias_mean_mw=("error_mw", "mean"),
+            mae_mw=("abs_error_mw", "mean"),
+            p90_abs_error_mw=("abs_error_mw", lambda x: x.quantile(0.90)),
+            rmse_mw=("error_mw", lambda x: np.sqrt(np.mean(x ** 2))),
+        )
+        .reset_index()
+    )
+
+    return out
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    pd.set_option("display.max_columns", None)
+    pd.set_option("display.width", 240)
+
+    df = load_data()
+    df = add_features(df)
+
+    print("\nFilas antes de filtrar demanda baja:", len(df))
+    print(
+        "Valores con demanda <= "
+        f"{LOW_DEMAND_THRESHOLD} MW:",
+        int((df["demand_mw"] <= LOW_DEMAND_THRESHOLD).sum())
+    )
+
+    suspicious = df[df["demand_mw"] <= LOW_DEMAND_THRESHOLD].head(10)
+    if len(suspicious) > 0:
+        print("\nPrimeros valores excluidos por demanda sospechosa:")
+        print(
+            suspicious[
+                [
+                    "timestamp_utc",
+                    "timestamp_madrid",
+                    "demand_mw",
+                    "temp_c",
+                    "season",
+                ]
+            ]
+        )
+
+    df = df[df["demand_mw"] > LOW_DEMAND_THRESHOLD].copy()
+
+    df = df.dropna(
+        subset=[
+            "temp_lag24",
+            "temp_mean_24h_prev",
+            "season",
+        ]
+    ).copy()
+
+    df["local_hour_cont"] = df["local_hour"].astype(float)
+
+    print("\nFilas tras limpieza:", len(df))
+
+    all_data_checks = []
+    all_metrics = []
+    all_pred_diagnostics = []
+    all_top_errors = []
+    all_monthly_errors = []
+
+    for season in SEASON_ORDER:
+        print("\n" + "=" * 90)
+        print(f"ESTACIÓN: {season}")
+        print("=" * 90)
+
+        sdf = df[df["season"] == season].copy()
+
+        train = sdf[sdf["local_year"] <= TRAIN_END_YEAR].copy()
+        test = sdf[sdf["local_year"] >= TEST_START_YEAR].copy()
+
+        if len(train) == 0 or len(test) == 0:
+            print(f"No hay suficientes datos para {season}.")
+            continue
+
+        print(f"Train: {train['local_year'].min()}-{train['local_year'].max()} | filas: {len(train):,}")
+        print(f"Test:  {test['local_year'].min()}-{test['local_year'].max()} | filas: {len(test):,}")
+
+        data_check = describe_train_test(season, train, test)
+        all_data_checks.append(data_check)
+
+        print("\nRangos de temperatura:")
+        print(
+            f"- Train: {data_check['train_temp_min']:.2f} ºC "
+            f"a {data_check['train_temp_max']:.2f} ºC"
+        )
+        print(
+            f"- Test:  {data_check['test_temp_min']:.2f} ºC "
+            f"a {data_check['test_temp_max']:.2f} ºC"
+        )
+
+        y_train = train["demand_mw"].to_numpy()
+        y_test = test["demand_mw"].to_numpy()
+
+        print("\nAjustando GAM SIN tendencia temporal...")
+        pred_train_no_trend, pred_test_no_trend = fit_gam_no_trend(train, test)
+
+        print("Ajustando GAM CON tendencia temporal...")
+        pred_train_with_trend, pred_test_with_trend = fit_gam_with_trend(train, test)
+
+        metrics_no_trend = evaluate_model(
+            "gam_no_trend",
+            season,
+            y_train,
+            pred_train_no_trend,
+            y_test,
+            pred_test_no_trend,
+        )
+
+        metrics_with_trend = evaluate_model(
+            "gam_with_trend",
+            season,
+            y_train,
+            pred_train_with_trend,
+            y_test,
+            pred_test_with_trend,
+        )
+
+        all_metrics.extend([metrics_no_trend, metrics_with_trend])
+
+        diag_no_trend = prediction_diagnostics(
+            season,
+            "gam_no_trend",
+            test,
+            pred_test_no_trend,
+        )
+
+        diag_with_trend = prediction_diagnostics(
+            season,
+            "gam_with_trend",
+            test,
+            pred_test_with_trend,
+        )
+
+        all_pred_diagnostics.extend([diag_no_trend, diag_with_trend])
+
+        all_top_errors.append(
+            top_errors(
+                season,
+                "gam_no_trend",
+                test,
+                pred_test_no_trend,
+                n=10,
+            )
+        )
+
+        all_top_errors.append(
+            top_errors(
+                season,
+                "gam_with_trend",
+                test,
+                pred_test_with_trend,
+                n=10,
+            )
+        )
+
+        all_monthly_errors.append(
+            monthly_errors(
+                season,
+                "gam_no_trend",
+                test,
+                pred_test_no_trend,
+            )
+        )
+
+        all_monthly_errors.append(
+            monthly_errors(
+                season,
+                "gam_with_trend",
+                test,
+                pred_test_with_trend,
+            )
+        )
+
+        print("\nMétricas:")
+        print(pd.DataFrame([metrics_no_trend, metrics_with_trend]))
+
+        print("\nDiagnóstico de predicciones en test:")
+        print(pd.DataFrame([diag_no_trend, diag_with_trend]))
+
+    # ========================================================
+    # EXPORTACIÓN
+    # ========================================================
+
+    data_checks_df = pd.DataFrame(all_data_checks)
+    metrics_df = pd.DataFrame(all_metrics)
+    pred_diag_df = pd.DataFrame(all_pred_diagnostics)
+    top_errors_df = pd.concat(all_top_errors, ignore_index=True)
+    monthly_errors_df = pd.concat(all_monthly_errors, ignore_index=True)
+
+    data_checks_path = OUT_DIR / "01_train_test_data_checks_by_season.csv"
+    metrics_path = OUT_DIR / "02_gam_metrics_no_trend_vs_with_trend_by_season.csv"
+    pred_diag_path = OUT_DIR / "03_prediction_ranges_by_season.csv"
+    top_errors_path = OUT_DIR / "04_top_absolute_errors_by_season.csv"
+    monthly_errors_path = OUT_DIR / "05_monthly_errors_by_season.csv"
+
+    data_checks_df.to_csv(data_checks_path, index=False, encoding="utf-8-sig")
+    metrics_df.to_csv(metrics_path, index=False, encoding="utf-8-sig")
+    pred_diag_df.to_csv(pred_diag_path, index=False, encoding="utf-8-sig")
+    top_errors_df.to_csv(top_errors_path, index=False, encoding="utf-8-sig")
+    monthly_errors_df.to_csv(monthly_errors_path, index=False, encoding="utf-8-sig")
+
+    print("\n" + "=" * 90)
+    print("RESUMEN FINAL")
+    print("=" * 90)
+
+    print("\nMétricas GAM sin tendencia vs con tendencia:")
+    print(metrics_df)
+
+    print("\nDiagnóstico de rangos de predicción:")
+    print(pred_diag_df)
+
+    print("\nArchivos generados:")
+    print(f"- {data_checks_path}")
+    print(f"- {metrics_path}")
+    print(f"- {pred_diag_path}")
+    print(f"- {top_errors_path}")
+    print(f"- {monthly_errors_path}")
+
+
+if __name__ == "__main__":
+    main()

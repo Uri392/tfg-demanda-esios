@@ -1,0 +1,53 @@
+import sqlite3
+import pandas as pd
+import matplotlib.pyplot as plt
+
+DB_PATH = r"data\db\master_energy.sqlite"
+
+con = sqlite3.connect(DB_PATH)
+
+demand = pd.read_sql("""
+SELECT CAST(substr(timestamp_utc, 6, 2) AS INTEGER) AS month,
+       AVG(demand_mw) AS mean_demand_mw
+FROM demand_peninsula_hourly
+GROUP BY month
+ORDER BY month;
+""", con)
+
+temp = pd.read_sql("""
+SELECT CAST(substr(timestamp_utc, 6, 2) AS INTEGER) AS month,
+       AVG(temp_c) AS mean_temp_c
+FROM temperature_peninsula_hourly
+GROUP BY month
+ORDER BY month;
+""", con)
+
+con.close()
+
+df = demand.merge(temp, on="month", how="inner")
+df["mean_demand_mw"] = df["mean_demand_mw"].round(1)
+df["mean_temp_c"] = df["mean_temp_c"].round(2)
+
+month_names = {1:"Ene",2:"Feb",3:"Mar",4:"Abr",5:"May",6:"Jun",7:"Jul",8:"Ago",9:"Sep",10:"Oct",11:"Nov",12:"Dic"}
+x_labels = [month_names[m] for m in df["month"]]
+
+fig, ax1 = plt.subplots(figsize=(10,5))
+
+# Demanda (línea continua)
+l1, = ax1.plot(df["month"], df["mean_demand_mw"], marker="o", label="Demanda media (MW)")
+ax1.set_xlabel("Mes")
+ax1.set_ylabel("Demanda media (MW)")
+ax1.set_xticks(df["month"])
+ax1.set_xticklabels(x_labels)
+
+# Temperatura (línea discontinua)
+ax2 = ax1.twinx()
+l2, = ax2.plot(df["month"], df["mean_temp_c"], marker="o", linestyle="--", label="Temperatura media (°C)")
+ax2.set_ylabel("Temperatura media (°C)")
+
+# Leyenda combinada
+ax1.legend(handles=[l1, l2], loc="upper right")
+
+plt.title("Año típico peninsular (2006–2025): demanda y temperatura media mensual")
+plt.tight_layout()
+plt.show()

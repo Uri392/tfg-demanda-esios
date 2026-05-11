@@ -1,0 +1,53 @@
+from pathlib import Path
+import sqlite3
+
+import pandas as pd
+
+
+MACRO_DB = Path("data/db/master_energy_macro.sqlite")
+TABLE_NAME = "macro_population_spain_annual"
+
+
+def main():
+    if not MACRO_DB.exists():
+        raise FileNotFoundError(f"No encuentro la base macro: {MACRO_DB}")
+
+    with sqlite3.connect(MACRO_DB) as conn:
+        tables = pd.read_sql_query(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+            ORDER BY name
+            """,
+            conn,
+        )
+
+        print("Tablas disponibles en la base macro:")
+        print(tables.to_string(index=False))
+
+        df = pd.read_sql_query(
+            f"""
+            SELECT *
+            FROM {TABLE_NAME}
+            ORDER BY year
+            """,
+            conn,
+        )
+
+    print("\nContenido de la tabla de población:")
+    print(df.to_string(index=False))
+
+    print("\nComprobaciones:")
+    print(f"- Filas: {len(df)}")
+    print(f"- Año mínimo: {df['year'].min()}")
+    print(f"- Año máximo: {df['year'].max()}")
+    print(f"- Población 2006: {df.loc[df['year'] == 2006, 'population_jan1'].iloc[0]:,}")
+    print(f"- Población 2024: {df.loc[df['year'] == 2024, 'population_jan1'].iloc[0]:,}")
+    print(f"- Población 2025*: {df.loc[df['year'] == 2025, 'population_jan1'].iloc[0]:,}")
+    print(f"- Estado 2025: {df.loc[df['year'] == 2025, 'status_ine'].iloc[0]}")
+    print(f"- 2025 provisional en bloque macro: {df.loc[df['year'] == 2025, 'is_provisional'].iloc[0]}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,242 @@
+from pathlib import Path
+import sqlite3
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# =========================
+# CONFIGURACIÓN
+# =========================
+
+DB_PATH = Path("data/db/master_energy.sqlite")
+OUT_DIR = Path("outputs/polynomial_all_hourly_filtered")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+DEGREES = [1, 2, 3, 4]
+
+TRAIN_END_YEAR = 2020
+TEST_START_YEAR = 2021
+
+MIN_VALID_DEMAND_MW = 15000
+
+
+# =========================
+# FUNCIONES
+# =========================
+
+def r2_score(y_true, y_pred):
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+
+    if ss_tot == 0:
+        return np.nan
+
+    return 1 - ss_res / ss_tot
+
+
+def adjusted_r2_score(r2, n, p):
+    if n <= p + 1:
+        return np.nan
+
+    return 1 - (1 - r2) * (n - 1) / (n - p - 1)
+
+
+def rmse(y_true, y_pred):
+    return np.sqrt(np.mean((y_true - y_pred) ** 2))
+
+
+def main():
+    if not DB_PATH.exists():
+        raise FileNotFoundError(f"No encuentro la base de datos en: {DB_PATH}")
+
+    print("Leyendo datos desde SQLite...")
+
+    query = """
+    SELECT
+        d.timestamp_utc,
+        d.demand_mw,
+        t.temp_c
+    FROM demand_peninsula_hourly d
+    INNER JOIN temperature_peninsula_hourly t
+        ON d.timestamp_utc = t.timestamp_utc
+    ORDER BY d.timestamp_utc
+    """
+
+    with sqlite3.connect(DB_PATH) as conn:
+        df = pd.read_sql_query(query, conn)
+
+    print(f"Filas leídas inicialmente: {len(df):,}")
+
+    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"])
+    df["demand_mw"] = pd.to_numeric(df["demand_mw"], errors="coerce")
+    df["temp_c"] = pd.to_numeric(df["temp_c"], errors="coerce")
+
+    df = df.dropna(subset=["timestamp_utc", "demand_mw", "temp_c"])
+
+    # Guardamos las observaciones excluidas
+    excluded = df[df["demand_mw"] <= MIN_VALID_DEMAND_MW].copy()
+
+    excluded_path = OUT_DIR / f"excluded_demand_le_{MIN_VALID_DEMAND_MW}_mw.csv"
+    excluded.to_csv(excluded_path, index=False)
+
+    print(f"Observaciones excluidas con demanda <= {MIN_VALID_DEMAND_MW} MW: {len(excluded):,}")
+
+    if len(excluded) > 0:
+        print("\nObservaciones excluidas:")
+        print(excluded[["timestamp_utc", "demand_mw", "temp_c"]].to_string(index=False))
+
+    # Filtrado principal
+    df = df[df["demand_mw"] > MIN_VALID_DEMAND_MW].copy()
+
+    print(f"\nFilas usadas tras filtrado: {len(df):,}")
+
+    df["year"] = df["timestamp_utc"].dt.year
+
+    print(
+        "Rango temporal usado: "
+        f"{df['timestamp_utc'].min()} a {df['timestamp_utc'].max()}"
+    )
+    print(
+        "Rango temperatura usado: "
+        f"{df['temp_c'].min():.2f} ºC a {df['temp_c'].max():.2f} ºC"
+    )
+    print(
+        "Rango demanda usado: "
+        f"{df['demand_mw'].min():.0f} MW a {df['demand_mw'].max():.0f} MW"
+    )
+
+    train = df[df["year"] <= TRAIN_END_YEAR].copy()
+    test = df[df["year"] >= TEST_START_YEAR].copy()
+
+    print(f"\nFilas entrenamiento <= {TRAIN_END_YEAR}: {len(train):,}")
+    print(f"Filas test >= {TEST_START_YEAR}: {len(test):,}")
+
+    x_all = df["temp_c"].to_numpy()
+    y_all = df["demand_mw"].to_numpy()
+
+    x_train = train["temp_c"].to_numpy()
+    y_train = train["demand_mw"].to_numpy()
+
+    x_test = test["temp_c"].to_numpy()
+    y_test = test["demand_mw"].to_numpy()
+
+    x_grid = np.linspace(x_all.min(), x_all.max(), 500)
+
+    results = []
+    fitted_curves = {}
+
+    for degree in DEGREES:
+        coeffs = np.polyfit(x_train, y_train, degree)
+        poly = np.poly1d(coeffs)
+
+        y_pred_train = poly(x_train)
+        y_pred_test = poly(x_test)
+        y_pred_all = poly(x_all)
+
+        r2_train = r2_score(y_train, y_pred_train)
+        r2_test = r2_score(y_test, y_pred_test)
+        r2_all = r2_score(y_all, y_pred_all)
+
+        adj_r2_all = adjusted_r2_score(
+            r2=r2_all,
+            n=len(y_all),
+            p=degree
+        )
+
+        rmse_train = rmse(y_train, y_pred_train)
+        rmse_test = rmse(y_test, y_pred_test)
+        rmse_all = rmse(y_all, y_pred_all)
+
+        fitted_curves[degree] = poly(x_grid)
+
+        results.append({
+            "degree": degree,
+            "r2_train_2006_2020": r2_train,
+            "r2_test_2021_2025": r2_test,
+            "r2_all": r2_all,
+            "adjusted_r2_all": adj_r2_all,
+            "rmse_train_mw": rmse_train,
+            "rmse_test_mw": rmse_test,
+            "rmse_all_mw": rmse_all,
+            "coefficients_high_to_low": coeffs.tolist(),
+        })
+
+    results_df = pd.DataFrame(results)
+
+    metrics_path = OUT_DIR / "polyfit_all_hourly_filtered_metrics.csv"
+    results_df.to_csv(metrics_path, index=False)
+
+    print("\nComparación de métricas sobre datos horarios filtrados:")
+    print(
+        results_df[
+            [
+                "degree",
+                "r2_train_2006_2020",
+                "r2_test_2021_2025",
+                "r2_all",
+                "adjusted_r2_all",
+                "rmse_train_mw",
+                "rmse_test_mw",
+                "rmse_all_mw",
+            ]
+        ].to_string(index=False)
+    )
+
+    plt.figure(figsize=(10, 6))
+
+    hb = plt.hexbin(
+        x_all,
+        y_all,
+        gridsize=80,
+        mincnt=1,
+        bins="log"
+    )
+
+    cbar = plt.colorbar(hb)
+    cbar.set_label("Densidad de observaciones horarias (escala log)")
+
+    for degree in DEGREES:
+        row = results_df[results_df["degree"] == degree].iloc[0]
+
+        plt.plot(
+            x_grid,
+            fitted_curves[degree],
+            linewidth=2,
+            label=(
+                f"Grado {degree} | "
+                f"R² all={row['r2_all']:.3f} | "
+                f"R² test={row['r2_test_2021_2025']:.3f}"
+            )
+        )
+
+    plt.xlabel("Temperatura horaria peninsular (ºC)")
+    plt.ylabel("Demanda horaria peninsular (MW)")
+    plt.title(
+        "Ajustes polinómicos sobre datos horarios filtrados\n"
+        f"Excluyendo demanda <= {MIN_VALID_DEMAND_MW} MW"
+    )
+    plt.grid(True, alpha=0.3)
+    plt.legend(fontsize=8)
+    plt.tight_layout()
+
+    fig_path = OUT_DIR / "polyfit_all_hourly_filtered_degrees_1_4.png"
+    plt.savefig(fig_path, dpi=200)
+    plt.close()
+
+    print("\nArchivos generados:")
+    print(f"- {metrics_path}")
+    print(f"- {fig_path}")
+    print(f"- {excluded_path}")
+
+    print("\nNota crítica:")
+    print(
+        "Este filtrado no convierte el polinomio en un buen modelo horario. "
+        "Solo elimina observaciones no representativas del comportamiento normal. "
+        "La temperatura seguirá explicando una parte limitada de la variabilidad horaria."
+    )
+
+
+if __name__ == "__main__":
+    main()

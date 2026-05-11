@@ -1,0 +1,200 @@
+from pathlib import Path
+import sqlite3
+
+import pandas as pd
+
+
+MACRO_DB = Path("data/db/master_energy_macro.sqlite")
+OUT_DIR = Path("outputs/macro")
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+TABLE_NAME = "macro_electricity_demand_peninsula_annual"
+
+LOW_DEMAND_THRESHOLD_MW = 15000
+
+
+def main():
+    if not MACRO_DB.exists():
+        raise FileNotFoundError(f"No encuentro la base macro: {MACRO_DB}")
+
+    with sqlite3.connect(MACRO_DB) as conn:
+        query = """
+        SELECT
+            timestamp_utc,
+            demand_mw
+        FROM demand_peninsula_hourly
+        ORDER BY timestamp_utc
+        """
+
+        df = pd.read_sql_query(query, conn)
+
+    print(f"Filas horarias leídas: {len(df):,}")
+
+    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"])
+    df["demand_mw"] = pd.to_numeric(df["demand_mw"], errors="coerce")
+
+    before = len(df)
+    df = df.dropna(subset=["timestamp_utc", "demand_mw"])
+    after = len(df)
+
+    if after < before:
+        print(f"Filas eliminadas por NaN: {before - after:,}")
+
+    df["year"] = df["timestamp_utc"].dt.year
+    df["is_low_demand_value"] = df["demand_mw"] <= LOW_DEMAND_THRESHOLD_MW
+
+    print(f"Año mínimo: {df['year'].min()}")
+    print(f"Año máximo: {df['year'].max()}")
+
+    # =========================
+    # Agregación anual RAW
+    # =========================
+
+    annual_raw = (
+        df.groupby("year")
+        .agg(
+            n_hours=("demand_mw", "size"),
+            electricity_demand_mwh_raw=("demand_mw", "sum"),
+            min_demand_mw=("demand_mw", "min"),
+            max_demand_mw=("demand_mw", "max"),
+            mean_demand_mw=("demand_mw", "mean"),
+            n_low_demand_values=("is_low_demand_value", "sum"),
+        )
+        .reset_index()
+    )
+
+    annual_raw["electricity_demand_gwh_raw"] = (
+        annual_raw["electricity_demand_mwh_raw"] / 1_000
+    )
+
+    annual_raw["electricity_demand_twh_raw"] = (
+        annual_raw["electricity_demand_mwh_raw"] / 1_000_000
+    )
+
+    # =========================
+    # Agregación excluyendo valores bajos
+    # =========================
+
+    df_filtered = df[df["demand_mw"] > LOW_DEMAND_THRESHOLD_MW].copy()
+
+    annual_filtered = (
+        df_filtered.groupby("year")
+        .agg(
+            electricity_demand_mwh_excluding_low_values=("demand_mw", "sum")
+        )
+        .reset_index()
+    )
+
+    annual_filtered["electricity_demand_twh_excluding_low_values"] = (
+        annual_filtered["electricity_demand_mwh_excluding_low_values"] / 1_000_000
+    )
+
+    # =========================
+    # Unir versiones
+    # =========================
+
+    annual = annual_raw.merge(
+        annual_filtered[
+            [
+                "year",
+                "electricity_demand_mwh_excluding_low_values",
+                "electricity_demand_twh_excluding_low_values",
+            ]
+        ],
+        on="year",
+        how="left",
+    )
+
+    annual["low_value_threshold_mw"] = LOW_DEMAND_THRESHOLD_MW
+
+    annual["difference_raw_vs_excluding_low_twh"] = (
+        annual["electricity_demand_twh_raw"]
+        - annual["electricity_demand_twh_excluding_low_values"]
+    )
+
+    # Ordenar columnas
+    annual = annual[
+        [
+            "year",
+            "n_hours",
+            "electricity_demand_mwh_raw",
+            "electricity_demand_gwh_raw",
+            "electricity_demand_twh_raw",
+            "electricity_demand_mwh_excluding_low_values",
+            "electricity_demand_twh_excluding_low_values",
+            "difference_raw_vs_excluding_low_twh",
+            "n_low_demand_values",
+            "low_value_threshold_mw",
+            "min_demand_mw",
+            "max_demand_mw",
+            "mean_demand_mw",
+        ]
+    ]
+
+    # =========================
+    # Guardar CSV y tabla SQLite
+    # =========================
+
+    out_csv = OUT_DIR / "electricity_demand_peninsula_annual_2006_2025.csv"
+    annual.to_csv(out_csv, index=False, encoding="utf-8")
+
+    with sqlite3.connect(MACRO_DB) as conn:
+        cur = conn.cursor()
+
+        cur.execute(f"DROP TABLE IF EXISTS {TABLE_NAME}")
+
+        cur.execute(
+            f"""
+            CREATE TABLE {TABLE_NAME} (
+                year INTEGER PRIMARY KEY,
+                n_hours INTEGER NOT NULL,
+                electricity_demand_mwh_raw REAL NOT NULL,
+                electricity_demand_gwh_raw REAL NOT NULL,
+                electricity_demand_twh_raw REAL NOT NULL,
+                electricity_demand_mwh_excluding_low_values REAL,
+                electricity_demand_twh_excluding_low_values REAL,
+                difference_raw_vs_excluding_low_twh REAL,
+                n_low_demand_values INTEGER NOT NULL,
+                low_value_threshold_mw REAL NOT NULL,
+                min_demand_mw REAL,
+                max_demand_mw REAL,
+                mean_demand_mw REAL
+            )
+            """
+        )
+
+        annual.to_sql(TABLE_NAME, conn, if_exists="append", index=False)
+
+        conn.commit()
+
+    print("\nTabla anual de demanda creada correctamente:")
+    print(f"- Base: {MACRO_DB}")
+    print(f"- Tabla: {TABLE_NAME}")
+    print(f"- CSV: {out_csv}")
+
+    print("\nResumen anual:")
+    print(
+        annual[
+            [
+                "year",
+                "n_hours",
+                "electricity_demand_twh_raw",
+                "n_low_demand_values",
+                "difference_raw_vs_excluding_low_twh",
+                "min_demand_mw",
+                "max_demand_mw",
+            ]
+        ].to_string(index=False)
+    )
+
+    print("\nComprobación importante:")
+    print(
+        "La columna raw suma todos los valores horarios. "
+        "La columna excluding_low_values excluye demanda <= "
+        f"{LOW_DEMAND_THRESHOLD_MW} MW. De momento no decidimos cuál usar; "
+        "solo medimos el impacto."
+    )
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,84 @@
+from pathlib import Path
+import sqlite3
+
+import pandas as pd
+
+
+MACRO_DB = Path("data/db/master_energy_macro.sqlite")
+POPULATION_CSV = Path("data/external/macro/population_spain_ine_2006_2025.csv")
+
+TABLE_NAME = "macro_population_spain_annual"
+
+
+def main():
+    if not MACRO_DB.exists():
+        raise FileNotFoundError(
+            f"No encuentro la base macro: {MACRO_DB}\n"
+            "Ejecuta antes los pasos anteriores donde se crea master_energy_macro.sqlite."
+        )
+
+    if not POPULATION_CSV.exists():
+        raise FileNotFoundError(
+            f"No encuentro el CSV de población: {POPULATION_CSV}\n"
+            "Ejecuta antes el script 05_create_population_csv_ine.py"
+        )
+
+    df = pd.read_csv(POPULATION_CSV)
+
+    expected_cols = {
+        "year",
+        "population_jan1",
+        "population_date",
+        "status_ine",
+        "is_provisional",
+        "source",
+        "notes",
+    }
+
+    missing = expected_cols - set(df.columns)
+    if missing:
+        raise ValueError(f"Faltan columnas en el CSV: {missing}")
+
+    if df["year"].duplicated().any():
+        duplicated_years = df.loc[df["year"].duplicated(), "year"].tolist()
+        raise ValueError(f"Hay años duplicados: {duplicated_years}")
+
+    if df["year"].min() != 2006 or df["year"].max() != 2025:
+        raise ValueError(
+            f"Rango de años inesperado: {df['year'].min()}-{df['year'].max()}"
+        )
+
+    if len(df) != 20:
+        raise ValueError(f"Se esperaban 20 filas, pero hay {len(df)}")
+
+    with sqlite3.connect(MACRO_DB) as conn:
+        cur = conn.cursor()
+
+        cur.execute(f"DROP TABLE IF EXISTS {TABLE_NAME}")
+
+        cur.execute(
+            f"""
+            CREATE TABLE {TABLE_NAME} (
+                year INTEGER PRIMARY KEY,
+                population_jan1 INTEGER NOT NULL,
+                population_date TEXT,
+                status_ine TEXT,
+                is_provisional INTEGER NOT NULL,
+                source TEXT,
+                notes TEXT
+            )
+            """
+        )
+
+        df.to_sql(TABLE_NAME, conn, if_exists="append", index=False)
+
+        conn.commit()
+
+    print("Tabla de población importada correctamente:")
+    print(f"- Base: {MACRO_DB}")
+    print(f"- Tabla: {TABLE_NAME}")
+    print(f"- Filas importadas: {len(df)}")
+
+
+if __name__ == "__main__":
+    main()

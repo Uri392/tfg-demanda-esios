@@ -1,0 +1,66 @@
+import sqlite3
+import pandas as pd
+import matplotlib.pyplot as plt
+
+DB_PATH = r"data\db\master_energy.sqlite"
+
+season_case = """
+CASE
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (12, 1, 2) THEN 'Invierno'
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (3, 4, 5) THEN 'Primavera'
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (6, 7, 8) THEN 'Verano'
+  WHEN CAST(substr(timestamp_utc, 6, 2) AS INTEGER) IN (9,10,11) THEN 'Otoño'
+END
+"""
+
+con = sqlite3.connect(DB_PATH)
+
+demand = pd.read_sql(f"""
+SELECT
+  {season_case} AS season,
+  CAST(substr(timestamp_utc, 12, 2) AS INTEGER) AS hour,
+  AVG(demand_mw) AS mean_demand_mw
+FROM demand_peninsula_hourly
+GROUP BY season, hour
+ORDER BY season, hour;
+""", con)
+
+temp = pd.read_sql(f"""
+SELECT
+  {season_case} AS season,
+  CAST(substr(timestamp_utc, 12, 2) AS INTEGER) AS hour,
+  AVG(temp_c) AS mean_temp_c
+FROM temperature_peninsula_hourly
+GROUP BY season, hour
+ORDER BY season, hour;
+""", con)
+
+con.close()
+
+# ----- Plot demanda -----
+plt.figure(figsize=(10,5))
+for s in ["Invierno","Primavera","Verano","Otoño"]:
+    df_s = demand[demand["season"] == s]
+    plt.plot(df_s["hour"], df_s["mean_demand_mw"], label=s)
+
+plt.title("Día típico por estación - Demanda media (MW)")
+plt.xlabel("Hora del día")
+plt.ylabel("Demanda media (MW)")
+plt.xticks(range(0,24,2))
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ----- Plot temperatura -----
+plt.figure(figsize=(10,5))
+for s in ["Invierno","Primavera","Verano","Otoño"]:
+    df_s = temp[temp["season"] == s]
+    plt.plot(df_s["hour"], df_s["mean_temp_c"], label=s)
+
+plt.title("Día típico por estación - Temperatura media (°C)")
+plt.xlabel("Hora del día")
+plt.ylabel("Temperatura media (°C)")
+plt.xticks(range(0,24,2))
+plt.legend()
+plt.tight_layout()
+plt.show()
